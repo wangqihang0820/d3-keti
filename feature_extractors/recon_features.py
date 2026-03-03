@@ -458,6 +458,11 @@ class ReconFeatures(nn.Module):
 
         # 可视化需要的原始输入（rgb, depth, ps）
         self.vis_samples = []   # list[(rgb_b, depth_b, ps_b)]
+        
+        
+        # ★ 新增：初始化用于缓存可视化热力图的空列表
+        self.maps_2d = [] 
+        self.maps_3d = []
 
     def compute_hybrid_loss(self, pred, target, dim=-1):
         """
@@ -570,8 +575,8 @@ class ReconFeatures(nn.Module):
         # rgb_recon: [B, 3, H, W]
         # xyz_recon: [B, 1, H, W]
         # === 调试打印 ===
-        print(f"Center Range - X: [{center[..., 0].min().item():.2f}, {center[..., 0].max().item():.2f}]")
-        print(f"Center Range - Y: [{center[..., 1].min().item():.2f}, {center[..., 1].max().item():.2f}]")
+        # print(f"Center Range - X: [{center[..., 0].min().item():.2f}, {center[..., 0].max().item():.2f}]")
+        # print(f"Center Range - Y: [{center[..., 1].min().item():.2f}, {center[..., 1].max().item():.2f}]")
 
         # -------------------------
         # 4. 重建误差 map
@@ -612,8 +617,14 @@ class ReconFeatures(nn.Module):
                                   mode='bilinear', align_corners=False).squeeze(1)
         
         # 高斯模糊 (平滑噪声)
-        err_2d_smooth = self.blur(err_2d.unsqueeze(1).cpu()).squeeze(1).to(self.device)
-        err_3d_smooth = self.blur(err_3d_map.unsqueeze(1).cpu()).squeeze(1).to(self.device)
+        # err_2d_smooth = self.blur(err_2d.unsqueeze(1).cpu()).squeeze(1).to(self.device)
+        # err_3d_smooth = self.blur(err_3d_map.unsqueeze(1).cpu()).squeeze(1).to(self.device)
+        # 4. 平滑 (增加维度强校验，防止 blur 吞掉 Batch 维度)
+        err_2d_smooth = self.blur(err_2d.unsqueeze(1).cpu()).to(self.device)
+        err_2d_smooth = err_2d_smooth.view(B, self.img_size_val, self.img_size_val)
+        
+        err_3d_smooth = self.blur(err_3d_map.unsqueeze(1).cpu()).to(self.device)
+        err_3d_smooth = err_3d_smooth.view(B, self.img_size_val, self.img_size_val)
 
         # 5. ★ 推理融合：直接相加 (等价于 alpha=0.5, beta=0.5)
         # 这样任何一个分支检测到的缺陷 (高误差) 都会被保留
@@ -627,7 +638,7 @@ class ReconFeatures(nn.Module):
         fused = fused.cpu()
         for b in range(B):
             gmap = gt[b, 0]           # [Hg, Wg]
-            fmap = fused[b, 0]          # [1,H,W] / [H,W] / [1,L] / [L]
+            fmap = fused[b]          # [1,H,W] / [H,W] / [1,L] / [L]
 
             # ========= 现在 fmap / gmap 都是 [Hg, Wg] =========
             img_score = float(fmap.max())
@@ -635,8 +646,8 @@ class ReconFeatures(nn.Module):
             self.image_labels.append(int(label[b]))
 
             # 存展平的像素 (慎用，内存大)
-            self.pixel_preds.extend(fmap.flatten().numpy().tolist())
-            self.pixel_labels.extend(gmap.flatten().numpy().tolist())
+            # self.pixel_preds.extend(fmap.flatten().numpy().tolist())
+            # self.pixel_labels.extend(gmap.flatten().numpy().tolist())
 
             self.gts.append(gmap.numpy())
             self.pred_maps.append(fmap.clone())
@@ -683,8 +694,22 @@ class ReconFeatures(nn.Module):
         else:
             self.image_rocauc = float("nan")
 
+
+        # 2. 计算像素级 (Pixel-level) AUROC
+        # 利用推断阶段已经保存好的 gts (Mask) 和 pred_maps (热力图)
+        # 将它们全部拉平 (flatten) 并拼接成两个超长的一维 numpy 数组
+        
+        # self.gts 里面是 numpy array，直接 flatten
+        gts_flat = np.concatenate([gt.flatten() for gt in self.gts])
+        
+        # self.pred_maps 里面是 tensor，先转 numpy 再 flatten
+        preds_flat = np.concatenate([pred.cpu().numpy().flatten() for pred in self.pred_maps])
+        
+        # 3. 确保两者维度完全一致后再送入 sklearn
+        assert gts_flat.shape == preds_flat.shape, f"Shape mismatch: GT {gts_flat.shape} vs Pred {preds_flat.shape}"
+        self.pixel_rocauc = float(roc_auc_score(gts_flat, preds_flat))
         # 像素级 ROC
-        self.pixel_rocauc = float(roc_auc_score(self.pixel_labels, self.pixel_preds))
+        # self.pixel_rocauc = float(roc_auc_score(self.pixel_labels, self.pixel_preds))
 
         # -------- AU-PRO：确保传入 numpy 数组 --------
         # gts_np = [
