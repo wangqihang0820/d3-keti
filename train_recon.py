@@ -72,7 +72,9 @@ def save_visualizations(save_root, idx, sample, mask, s_map, s_map_2d, s_map_3d)
     # ★ 2. 修正：确保目录存在
     os.makedirs(save_root, exist_ok=True)
     
-    rgb_tensor = sample[0]
+    # rgb_tensor = sample[0]
+    # ★ 消除 batch 维度，从 [1, 3, H, W] 变成 [3, H, W]
+    rgb_tensor = sample[0].squeeze(0) if sample[0].dim() == 4 else sample[0]
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     rgb_denorm = rgb_tensor.cpu() * std + mean
@@ -81,8 +83,17 @@ def save_visualizations(save_root, idx, sample, mask, s_map, s_map_2d, s_map_3d)
     
     def render_heatmap(error_map):
         error_map = error_map.cpu().numpy() if isinstance(error_map, torch.Tensor) else error_map
-        if error_map.max() > 0:
-            error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min())
+        # if error_map.max() > 0:
+        #     error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min())
+        # else:
+        #     error_map = np.zeros_like(error_map)
+        # ★ 核心修复：使用 99% 和 1% 分位数替代绝对的 max 和 min
+        max_val = np.percentile(error_map, 99.5)
+        min_val = np.percentile(error_map, 0.5)
+        
+        if max_val > min_val:
+            # clip 限制在 0~1 之间
+            error_map = np.clip((error_map - min_val) / (max_val - min_val), 0, 1)
         else:
             error_map = np.zeros_like(error_map)
         heatmap = cv2.applyColorMap((error_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
@@ -239,7 +250,7 @@ if __name__ == "__main__":
         classes = [args.dataset_type]
 
     for cls in classes:
-        train_recon(args, class_name=cls)
+        # train_recon(args, class_name=cls)
         eval_recon(args, class_name=cls)
         
         
