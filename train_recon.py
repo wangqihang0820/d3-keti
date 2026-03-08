@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm  # 引入进度条
 import random
+import matplotlib.pyplot as plt  # ★ 新增：用于绘制 Loss 曲线
 
 
 
@@ -87,6 +88,9 @@ def save_visualizations(save_root, idx, sample, mask, s_map, s_map_2d, s_map_3d)
         #     error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min())
         # else:
         #     error_map = np.zeros_like(error_map)
+        
+        # ★ 终极修复：强行挤掉多余的通道维度，确保它是纯粹的 2D 数组 (H, W)
+        error_map = np.squeeze(error_map)
         # ★ 核心修复：使用 99% 和 1% 分位数替代绝对的 max 和 min
         max_val = np.percentile(error_map, 99.5)
         min_val = np.percentile(error_map, 0.5)
@@ -96,7 +100,10 @@ def save_visualizations(save_root, idx, sample, mask, s_map, s_map_2d, s_map_3d)
             error_map = np.clip((error_map - min_val) / (max_val - min_val), 0, 1)
         else:
             error_map = np.zeros_like(error_map)
-        heatmap = cv2.applyColorMap((error_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        
+        # 转换为 uint8 格式
+        error_map_uint8 = (error_map * 255).astype(np.uint8)
+        heatmap = cv2.applyColorMap(error_map_uint8, cv2.COLORMAP_JET)
         return cv2.resize(heatmap, (rgb_np.shape[1], rgb_np.shape[0]))
 
     heatmap_total = render_heatmap(s_map)
@@ -145,9 +152,25 @@ def train_recon(args, class_name):
         img_size=args.img_size_val,
         args=args  # 这里 args 包含了 batch_size
     )
+    
+    # ==========================================
+    # ★ 新增 1：初始化历史记录列表
+    # ==========================================
+    history = {
+        'loss_total': [],
+        'loss_2d': [],
+        'loss_3d': [],
+        'loss_geo': [],
+        'ot_alpha': [],
+        'ot_beta': []
+    }
 
     for epoch in range(1, args.epochs + 1):
-        epoch_loss = 0.0
+        # epoch_loss = 0.0
+        # ★ 新增 2：初始化当前 Epoch 的累加器
+        epoch_sums = {k: 0.0 for k in history.keys()}
+        steps = 0
+        
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
         
         for sample, _ in pbar:
@@ -175,7 +198,15 @@ def train_recon(args, class_name):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
-            epoch_loss += loss_total.item()
+            # epoch_loss += loss_total.item()
+            # ★ 新增 3：累加当前 batch 的指标
+            epoch_sums['loss_total'] += loss_total.item()
+            epoch_sums['loss_2d'] += loss_dict['l2d']
+            epoch_sums['loss_3d'] += loss_dict['l3d']
+            epoch_sums['loss_geo'] += loss_dict['geo']
+            epoch_sums['ot_alpha'] += loss_dict['alpha']
+            epoch_sums['ot_beta'] += loss_dict['beta']
+            steps += 1
             
             # 显示 OT 动态调整的权重
             # 你会看到 alpha 和 beta 随着 epoch 变化，这证明 OT 在工作
@@ -191,10 +222,140 @@ def train_recon(args, class_name):
         
         # 更新学习率
         scheduler.step()
+        
+        # ★ 新增 4：计算该 Epoch 的平均值并存入历史记录
+        for k in history.keys():
+            history[k].append(epoch_sums[k] / steps)
+
+    # === 150 轮结束 ===
+    # ★ 在保存模型权重之前，强制遍历一次训练集，提取像素级基线记忆
+    print("\n[Final Stage] Initializing Z-Score Database...")
+    model.build_error_statistics(train_loader)
 
     ckpt_path = os.path.join(args.save_dir, f"{class_name}_recon.pth")
     torch.save(model.net.state_dict(), ckpt_path)
     print(f"Model saved to {ckpt_path}")
+    
+    # ★ 新增 5：训练结束后，自动绘制并保存曲线图
+    plot_training_curves(history, args.save_dir, class_name)
+
+# def train_recon(args, class_name):
+#     setup_seed(args.random_state)
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+#     os.makedirs(args.save_dir, exist_ok=True)
+    
+#     print(f"\n[Training] Class: {class_name} | Batch: {args.batch_size}")
+
+#     model = ReconFeatures(args).to(device)
+#     model.train()
+    
+#     optimizer = torch.optim.AdamW(
+#         model.net.parameters(), 
+#         lr=args.lr, 
+#         weight_decay=args.weight_decay
+#     )
+#     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+
+#     train_loader = get_data_loader(
+#         split="train",
+#         class_name=class_name,
+#         img_size=args.img_size_val,
+#         args=args
+#     )
+
+#     # ========================================================
+#     # ★ 单 Batch 过拟合极速测试法 (开始)
+#     # ========================================================
+#     print("\n🚀 开始执行单 Batch 过拟合测试 (预计耗时: 2分钟)...")
+    
+#     # 1. 强行从 loader 中抽出第一个 batch (只取一次)
+#     single_batch_data = next(iter(train_loader))
+    
+#     # 2. 我们只跑 50 轮
+#     for epoch in range(1, 51):
+#         optimizer.zero_grad()
+        
+#         # 3. 每轮都用这死死固定的同一个 batch
+#         sample, _ = single_batch_data 
+        
+#         # 注意：这里直接调用你原来的 train_step，不需要自己写 forward
+#         loss_dict = model.train_step(sample)
+        
+#         loss_total = loss_dict['loss']
+#         loss_total.backward()
+        
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+#         optimizer.step()
+        
+#         # 4. 直接打印日志看变化
+#         print(f"Epoch [{epoch:02d}/50] "
+#               f"Total Loss: {loss_total.item():.4f} | "
+#               f"2D Loss: {loss_dict['l2d']:.4f} | "
+#               f"3D Loss: {loss_dict['l3d']:.4f} | "
+#               f"α: {loss_dict['alpha']:.2f} | β: {loss_dict['beta']:.2f}")
+        
+#         scheduler.step()
+
+#     print("\n✅ 单 Batch 测试结束！请观察上面的 Loss 变化。")
+#     import sys
+#     sys.exit(0) # 强制退出，不保存模型，不跑评估
+#     # ========================================================
+#     # ★ 单 Batch 过拟合极速测试法 (结束)
+#     # ========================================================
+
+def plot_training_curves(history, save_dir, class_name):
+    """
+    绘制并保存训练过程中的各项 Loss 和 OT 权重走向
+    """
+    epochs = range(1, len(history['loss_total']) + 1)
+    
+    plt.figure(figsize=(15, 10))
+    
+    # 1. 绘制总 Loss
+    plt.subplot(2, 2, 1)
+    plt.plot(epochs, history['loss_total'], label='Total Loss', color='black', linewidth=2)
+    plt.title(f'[{class_name}] Total Training Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+    
+    # 2. 绘制 2D 和 3D 的子 Loss (观察谁更难收敛)
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs, history['loss_2d'], label='2D Loss (RGB)', color='red')
+    plt.plot(epochs, history['loss_3d'], label='3D Loss (XYZ)', color='blue')
+    plt.title('2D vs 3D Reconstruction Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+    
+    # 3. 绘制 几何正则化 Loss
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs, history['loss_geo'], label='Geo Loss (SharedBasis)', color='green')
+    plt.title('Geometric Regularization Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+    
+    # 4. 绘制 OT 动态权重分配 (观察模型侧重方向)
+    plt.subplot(2, 2, 4)
+    plt.plot(epochs, history['ot_alpha'], label='Alpha (2D Weight)', color='orange')
+    plt.plot(epochs, history['ot_beta'], label='Beta (3D Weight)', color='purple')
+    plt.title('Optimal Transport (OT) Weights Dynamics')
+    plt.xlabel('Epochs')
+    plt.ylabel('Weight')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    plot_path = os.path.join(save_dir, f"{class_name}_training_curves.png")
+    plt.savefig(plot_path, dpi=300)
+    plt.close()
+    print(f"Training curves saved to {plot_path}")
 
 @torch.no_grad()
 def eval_recon(args, class_name):
@@ -250,7 +411,7 @@ if __name__ == "__main__":
         classes = [args.dataset_type]
 
     for cls in classes:
-        # train_recon(args, class_name=cls)
+        train_recon(args, class_name=cls)
         eval_recon(args, class_name=cls)
         
         
