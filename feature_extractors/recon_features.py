@@ -77,12 +77,17 @@ class FusionReconNet(nn.Module):
         self.xyz_token_dim = 1152
         # 为了让 2D 和 3D 特征能做 cross-attn，把 3D token 映射到与 2D 相同维度
         self.xyz_proj = nn.Linear(self.xyz_token_dim, self.rgb_feat_dim)
+        # ==========================================
+        # ★ 新增：终极修复 1 —— 升维投影层
+        # 用于将解码器输出的 768 维特征升维回 1152 维，直面最纯正的物理几何真值！
+        # ==========================================
+        self.xyz_out_proj = nn.Linear(self.rgb_feat_dim, self.xyz_token_dim)
         
         # Step 2.2: 潜在空间随机掩码
         # 维度要和你 PointMAE 投影后的维度一致 (768)
         self.masking_module = LatentRandomMasking(
             input_dim=self.rgb_feat_dim, # 768
-            mask_ratio=0.6               # 文档要求 60%
+            mask_ratio=0.75               # 文档要求 60%
         )
 
         self.spectral_transform = SpectralTransform()
@@ -223,7 +228,7 @@ class FusionReconNet(nn.Module):
         #     rgb_feats_bottleneck = rgb_feats_css + noise
         # else:
         #     rgb_feats_bottleneck = rgb_feats_css
-       rgb_feats_bottleneck = rgb_feats_css
+        rgb_feats_bottleneck = rgb_feats_css.detach()
        
        
        # 兼容 xyz 输入格式
@@ -245,9 +250,14 @@ class FusionReconNet(nn.Module):
         # xyz_tokens: (B, 1152, G)  G = num_group = 64
         xyz_tokens = xyz_tokens.transpose(1, 2).contiguous()          # (B, G, 1152)
         xyz_tokens = torch.nan_to_num(xyz_tokens, nan=0.0, posinf=1e4, neginf=-1e4)
-        # 投影到 768 维度 -> [B, G, 768]
-        # 这就是文档中的 Fgt (Latent Ground Truth)
-        F_gt = self.xyz_proj(xyz_tokens)
+        # ==========================================
+        # ★ 终极修复 2：激活 3D 几何推断（摧毁死区）
+        # 直接拿 PointMAE 提取的、富含绝对空间形变信息的 1152 维特征作为真值 (F_gt)！
+        # ==========================================
+        F_gt = xyz_tokens.detach() 
+        
+        # 投影到 768 维度，作为网络内部处理（Mask 和 频域变换）的起点
+        F_in_raw = self.xyz_proj(xyz_tokens)
 
         # ==========================================
         # ★ Step 2.2: 潜在空间随机掩码
@@ -256,13 +266,13 @@ class FusionReconNet(nn.Module):
         # ==========================================
         if self.training:
             # 训练时：执行掩码
-            F_in, mask = self.masking_module(F_gt)
+            F_in, mask = self.masking_module(F_in_raw)
         else:
             # 测试/推理时：通常不掩码，或者是为了做修复任务而掩码？
             # 工业异常检测的常见做法是：推理时也掩码，看模型能不能修补回来。
             # 如果你的逻辑是“重构误差”，那么测试时也需要掩码。
             # 根据 PointMAE 原理，测试时通常也进行掩码重建。
-            F_in, mask = self.masking_module(F_gt)
+            F_in, mask = self.masking_module(F_in_raw)
             
             # 如果你想测试时全量输入(不掩码)，可以用:
             # F_in = F_gt
@@ -350,54 +360,149 @@ class FusionReconNet(nn.Module):
         # Input: [B, G, 768] -> Output: [B, G, 768] -> Fpred
         xyz_recon_feat = self.recon_3d(xyz_updated)
         
-        return rgb_recon_feat, xyz_recon_feat, rgb_feats_css, F_gt, loss_geo, U, mask, center, center_idx
+        # ==========================================
+        # ★ 终极修复 3：映射回 1152 维去计算损失
+        # ==========================================
+        xyz_recon_final_out = self.xyz_out_proj(xyz_recon_feat)
+        
+        return rgb_recon_feat, xyz_recon_final_out, rgb_feats_css, F_gt, loss_geo, U, mask, center, center_idx
 
 
 # ------------------------------------------------
 # 辅助函数：将稀疏的 3D 误差投影回 2D 图像
 # ------------------------------------------------
+# def splat_3d_error_to_2d_exact(errors, center_idx, img_size):
+#     """
+#     errors: [B, N] 离散点的重建误差 (N=1024)
+#     center_idx: [B, N] 这些点在原始 224x224 展平后的绝对像素索引
+#     """
+#     B, N = errors.shape
+#     H = W = img_size
+    
+#     # 初始化展平的画布 [B, H*W]
+#     error_map = torch.zeros((B, H * W), device=errors.device)
+#     count_map = torch.zeros((B, H * W), device=errors.device)
+    
+#     # ★ 修复 2：将 center_idx == 0 的无效填充点的误差强制清零
+#     # 这能防止所有无效点砸在左上角
+#     valid_mask = (center_idx > 0).float()
+#     errors_clean = errors * valid_mask
+    
+#     # ★ 绝对精确映射：直接用中心点原来的索引将误差填回对应的像素
+#     error_map.scatter_add_(1, center_idx.long(), errors_clean)
+#     count_map.scatter_add_(1, center_idx.long(), torch.ones_like(valid_mask))
+    
+#     # 计算平均值
+#     mask = count_map > 0
+#     error_map[mask] /= count_map[mask]
+    
+#     # 变回 2D 图像维度 [B, H, W]
+#     error_map = error_map.view(B, H, W)
+    
+#     # 扩散填补 FPS 采样带来的空洞
+#     # error_map = F.max_pool2d(error_map.unsqueeze(1), kernel_size=5, stride=1, padding=2).squeeze(1)
+#     # # ★ 修复 3D 马赛克：
+#     # # 1. 用 kernel=11 的 MaxPool 充分扩张，确保 1024 个点能完全覆盖所有空洞
+#     # error_map = F.max_pool2d(error_map.unsqueeze(1), kernel_size=11, stride=1, padding=5)
+    
+#     # # 2. 用 kernel=11 的 AvgPool 抹平方形的马赛克边缘，使其变成平滑的地形
+#     # error_map = F.avg_pool2d(error_map, kernel_size=11, stride=1, padding=5).squeeze(1)
+    
+#     # ★ 修复 3D 偏移：废除 max_pool 的膨胀效应，改用大核 AvgPool 均匀扩散，确保重心绝对居中！
+#     # error_map = F.avg_pool2d(error_map.unsqueeze(1), kernel_size=11, stride=1, padding=5)
+#     # error_map = F.avg_pool2d(error_map, kernel_size=5, stride=1, padding=2).squeeze(1)
+#     # === 替换为：先用紧凑的 MaxPool 填补采样空洞，再用小核 AvgPool 柔化边缘 ===
+#     error_map = F.max_pool2d(error_map.unsqueeze(1), kernel_size=7, stride=1, padding=3)
+#     # 取消掉 AvgPool，保持病灶边缘锋利
+#     error_map = F.avg_pool2d(error_map, kernel_size=3, stride=1, padding=1).squeeze(1)
+#     # error_map = error_map.squeeze(1)
+    
+    
+#     return error_map
+
+# def splat_3d_error_to_2d_exact(errors, center_idx, img_size):
+#     B, N = errors.shape
+    
+#     # 1. 降采样映射到低分辨率特征网格 (28x28)
+#     small_size = 28
+#     scale = img_size / small_size  # 224 / 28 = 8.0
+    
+#     y = center_idx // img_size
+#     x = center_idx % img_size
+    
+#     # 向下取整映射到 28x28 对应的索引
+#     y_small = torch.clamp((y.float() / scale).long(), 0, small_size - 1)
+#     x_small = torch.clamp((x.float() / scale).long(), 0, small_size - 1)
+#     idx_small = y_small * small_size + x_small
+    
+#     error_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
+#     count_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
+    
+#     valid_mask = (center_idx > 0).float()
+#     errors_clean = errors * valid_mask
+    
+#     # 在 28x28 网格上累加误差
+#     error_map_small.scatter_add_(1, idx_small.long(), errors_clean)
+#     count_map_small.scatter_add_(1, idx_small.long(), torch.ones_like(valid_mask))
+    
+#     # 求平均
+#     mask = count_map_small > 0
+#     error_map_small[mask] /= count_map_small[mask]
+#     error_map_small = error_map_small.view(B, 1, small_size, small_size)
+    
+#     # 2. 填补 28x28 网格中的微小缝隙（因为非常密集，只需极小的 kernel=3 即可）
+#     error_map_small = F.max_pool2d(error_map_small, kernel_size=3, stride=1, padding=1)
+    
+#     # 3. 终极平滑：双线性插值放大回 224x224，告别马赛克方块！
+#     error_map = F.interpolate(error_map_small, size=(img_size, img_size), mode='bilinear', align_corners=False)
+    
+#     return error_map.squeeze(1)
 def splat_3d_error_to_2d_exact(errors, center_idx, img_size):
-    """
-    errors: [B, N] 离散点的重建误差 (N=1024)
-    center_idx: [B, N] 这些点在原始 224x224 展平后的绝对像素索引
-    """
     B, N = errors.shape
-    H = W = img_size
     
-    # 初始化展平的画布 [B, H*W]
-    error_map = torch.zeros((B, H * W), device=errors.device)
-    count_map = torch.zeros((B, H * W), device=errors.device)
+    # 1. 降采样映射到低分辨率特征网格 (28x28)
+    small_size = 28
+    scale = img_size / small_size  # 224 / 28 = 8.0
     
-    # ★ 修复 2：将 center_idx == 0 的无效填充点的误差强制清零
-    # 这能防止所有无效点砸在左上角
+    y = center_idx // img_size
+    x = center_idx % img_size
+    
+    # 向下取整映射到 28x28 对应的索引
+    y_small = torch.clamp((y.float() / scale).long(), 0, small_size - 1)
+    x_small = torch.clamp((x.float() / scale).long(), 0, small_size - 1)
+    idx_small = y_small * small_size + x_small
+    
+    error_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
+    count_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
+    
     valid_mask = (center_idx > 0).float()
     errors_clean = errors * valid_mask
     
-    # ★ 绝对精确映射：直接用中心点原来的索引将误差填回对应的像素
-    error_map.scatter_add_(1, center_idx.long(), errors_clean)
-    count_map.scatter_add_(1, center_idx.long(), torch.ones_like(valid_mask))
+    # 在 28x28 网格上累加误差
+    error_map_small.scatter_add_(1, idx_small.long(), errors_clean)
+    count_map_small.scatter_add_(1, idx_small.long(), torch.ones_like(valid_mask))
     
-    # 计算平均值
-    mask = count_map > 0
-    error_map[mask] /= count_map[mask]
+    # 求平均
+    mask = count_map_small > 0
+    error_map_small[mask] /= count_map_small[mask]
     
-    # 变回 2D 图像维度 [B, H, W]
-    error_map = error_map.view(B, H, W)
+    error_map_small = error_map_small.view(B, 1, small_size, small_size)
+    count_map_small = count_map_small.view(B, 1, small_size, small_size)
     
-    # 扩散填补 FPS 采样带来的空洞
-    # error_map = F.max_pool2d(error_map.unsqueeze(1), kernel_size=5, stride=1, padding=2).squeeze(1)
-    # # ★ 修复 3D 马赛克：
-    # # 1. 用 kernel=11 的 MaxPool 充分扩张，确保 1024 个点能完全覆盖所有空洞
-    # error_map = F.max_pool2d(error_map.unsqueeze(1), kernel_size=11, stride=1, padding=5)
+    # ==========================================
+    # ★ 终极收缩：智能空洞填补 (Smart Hole-Filling)
+    # 只对没有采到点的空洞(0值区)进行邻域借值，绝不向外膨胀原本的高亮缺陷！
+    # ==========================================
+    empty_mask = (count_map_small == 0).float()
+    error_map_dilated = F.max_pool2d(error_map_small, kernel_size=3, stride=1, padding=1)
     
-    # # 2. 用 kernel=11 的 AvgPool 抹平方形的马赛克边缘，使其变成平滑的地形
-    # error_map = F.avg_pool2d(error_map, kernel_size=11, stride=1, padding=5).squeeze(1)
+    # 有点的地方保持原始锐利度，只有空洞才会加上膨胀值
+    error_map_small = error_map_small + error_map_dilated * empty_mask
     
-    # ★ 修复 3D 偏移：废除 max_pool 的膨胀效应，改用大核 AvgPool 均匀扩散，确保重心绝对居中！
-    error_map = F.avg_pool2d(error_map.unsqueeze(1), kernel_size=11, stride=1, padding=5)
-    error_map = F.avg_pool2d(error_map, kernel_size=5, stride=1, padding=2).squeeze(1)
+    # 3. 终极平滑：双线性插值放大回 224x224
+    error_map = F.interpolate(error_map_small, size=(img_size, img_size), mode='bilinear', align_corners=False)
     
-    return error_map
+    return error_map.squeeze(1)
 
 # ------------------------------------------------
 # 3. 重建式异常检测封装
@@ -422,7 +527,7 @@ class ReconFeatures(nn.Module):
             img_size=args.img_size_val,
         ).to(self.device)
 
-        self.blur = KNNGaussianBlur(4)
+        self.blur = KNNGaussianBlur(2)
         
         # 超参数
         # l2_weight: 辅助损失的权重，通常设小一点 (e.g. 0.1 或 0.5)
@@ -473,23 +578,53 @@ class ReconFeatures(nn.Module):
         
     #     return cosine_loss + self.l2_weight * l2_loss
     
+    # def compute_hybrid_loss(self, pred, target, dim=-1, mask=None):
+    #     """
+    #     混合损失函数：支持传入 mask，只计算掩码区域的 Loss
+    #     """
+    #     pred_safe = pred + 1e-8
+    #     target_safe = target + 1e-8
+        
+    #     # 1. Cosine Loss
+    #     # 2D: [B, H, W] | 3D: [B, N]
+    #     cosine_loss = 1 - F.cosine_similarity(pred_safe, target_safe, dim=dim)
+        
+    #     # 2. L2 Loss
+    #     # [B, C, H, W] 或 [B, N, C]
+    #     l2_loss_raw = F.mse_loss(pred, target, reduction='none')
+    #     if dim == 1: # 2D: 对通道求平均 -> [B, H, W]
+    #         l2_loss = l2_loss_raw.mean(dim=1)
+    #     else:        # 3D: 对通道求平均 -> [B, N]
+    #         l2_loss = l2_loss_raw.mean(dim=-1)
+            
+    #     total_loss_map = cosine_loss + self.l2_weight * l2_loss
+        
+    #     # 3. 掩码过滤
+    #     if mask is not None:
+    #         total_loss_map = total_loss_map * mask
+    #         # 只求有效区域的平均值
+    #         return total_loss_map.sum() / (mask.sum() + 1e-5)
+    #     else:
+    #         return total_loss_map.mean()
     def compute_hybrid_loss(self, pred, target, dim=-1, mask=None):
         """
-        混合损失函数：支持传入 mask，只计算掩码区域的 Loss
+        混合损失函数：强制 L2 归一化防坍缩
         """
         pred_safe = pred + 1e-8
         target_safe = target + 1e-8
         
         # 1. Cosine Loss
-        # 2D: [B, H, W] | 3D: [B, N]
         cosine_loss = 1 - F.cosine_similarity(pred_safe, target_safe, dim=dim)
         
-        # 2. L2 Loss
-        # [B, C, H, W] 或 [B, N, C]
+        # 2. L2 Loss (★ 核心修复：必须在 L2 归一化后计算，防止模型靠缩短向量长度作弊)
+        # pred_norm = F.normalize(pred, p=2, dim=dim)
+        # target_norm = F.normalize(target, p=2, dim=dim)
+        
         l2_loss_raw = F.mse_loss(pred, target, reduction='none')
-        if dim == 1: # 2D: 对通道求平均 -> [B, H, W]
+        
+        if dim == 1: # 2D: [B, H, W]
             l2_loss = l2_loss_raw.mean(dim=1)
-        else:        # 3D: 对通道求平均 -> [B, N]
+        else:        # 3D: [B, N]
             l2_loss = l2_loss_raw.mean(dim=-1)
             
         total_loss_map = cosine_loss + self.l2_weight * l2_loss
@@ -497,7 +632,6 @@ class ReconFeatures(nn.Module):
         # 3. 掩码过滤
         if mask is not None:
             total_loss_map = total_loss_map * mask
-            # 只求有效区域的平均值
             return total_loss_map.sum() / (mask.sum() + 1e-5)
         else:
             return total_loss_map.mean()
@@ -563,7 +697,7 @@ class ReconFeatures(nn.Module):
         # 文档: "Lrec = |Fpred - Fgt|^2"
         # 3D (Channel维度是 dim=2)
         # loss_3d = self.compute_hybrid_loss(xyz_recon, F_gt.detach(),dim = 2)
-        loss_3d = self.compute_hybrid_loss(xyz_recon, F_gt.detach(),dim = 2, mask=None)
+        loss_3d = self.compute_hybrid_loss(xyz_recon, F_gt.detach(),dim = 2, mask=mask)
         
         # # 3. ★ OT 计算权重 (传入 detach 防止作弊)
         # # 只有在训练时，我们希望"避重就轻"，让模型先学容易的，稳步收敛
@@ -618,16 +752,30 @@ class ReconFeatures(nn.Module):
             rgb_recon, xyz_recon, rgb_target, F_gt, _, _, _, _, center_idx = self.net(rgb, xyz, ps)
 
             # 1. 算 Raw 误差
-            rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)
-            rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
-            xyz_recon_norm = F.normalize(xyz_recon, p=2, dim=2)
-            F_gt_norm = F.normalize(F_gt, p=2, dim=2)
+            # === 彻底替换掉这 6 行旧代码 ===
+            # rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)
+            # rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
+            # xyz_recon_norm = F.normalize(xyz_recon, p=2, dim=2)
+            # F_gt_norm = F.normalize(F_gt, p=2, dim=2)
 
-            err_2d = torch.sum((rgb_recon_norm - rgb_target_norm) ** 2, dim=1)
+            # err_2d = torch.sum((rgb_recon_norm - rgb_target_norm) ** 2, dim=1)
+            # if err_2d.shape[-1] != self.img_size_val:
+            #     err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), mode='bilinear', align_corners=False).squeeze(1)
+
+            # err_3d_points = torch.sum((xyz_recon_norm - F_gt_norm) ** 2, dim=2)
+            
+            # === 彻底替换为真正的混合误差算子：余弦方向误差 + 绝对幅值误差 ===
+            
+            # 2D 误差图计算 (不归一化，保留绝对幅值)
+            err_2d = (1 - F.cosine_similarity(rgb_recon + 1e-8, rgb_target + 1e-8, dim=1)) + \
+                     self.l2_weight * torch.mean((rgb_recon - rgb_target) ** 2, dim=1)
+            
             if err_2d.shape[-1] != self.img_size_val:
                 err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), mode='bilinear', align_corners=False).squeeze(1)
 
-            err_3d_points = torch.sum((xyz_recon_norm - F_gt_norm) ** 2, dim=2)
+            # 3D 误差图计算 (不归一化，捕捉形变带来的空间偏移)
+            err_3d_points = (1 - F.cosine_similarity(xyz_recon + 1e-8, F_gt + 1e-8, dim=2)) + \
+                            self.l2_weight * torch.mean((xyz_recon - F_gt) ** 2, dim=2)
             # ★ 此处附带了你的 3D 偏移修复！
             err_3d_map = splat_3d_error_to_2d_exact(err_3d_points, center_idx, self.img_size_val)
 
@@ -695,29 +843,39 @@ class ReconFeatures(nn.Module):
         # 步骤 A: 计算误差数值 (L2 Norm + Euclidean)
         # ---------------------------------------------------
         
-        # 1. L2 归一化 (解决量级差异的关键)
-        rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)   # [B, C, H, W]
-        rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
+        # # 1. L2 归一化 (解决量级差异的关键)
+        # rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)   # [B, C, H, W]
+        # rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
         
-        xyz_recon_norm = F.normalize(xyz_recon, p=2, dim=2)   # [B, N, C]
-        F_gt_norm = F.normalize(F_gt, p=2, dim=2)
+        # xyz_recon_norm = F.normalize(xyz_recon, p=2, dim=2)   # [B, N, C]
+        # F_gt_norm = F.normalize(F_gt, p=2, dim=2)
 
-        # 2. 计算欧氏距离平方 (逐像素/逐点)
-        # 2D Error: [B, H, W]
-        err_2d = torch.sum((rgb_recon_norm - rgb_target_norm) ** 2, dim=1)
+        # # 2. 计算欧氏距离平方 (逐像素/逐点)
+        # # 2D Error: [B, H, W]
+        # err_2d = torch.sum((rgb_recon_norm - rgb_target_norm) ** 2, dim=1)
+        # if err_2d.shape[-1] != self.img_size_val:
+        #     err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), 
+        #                           mode='bilinear', align_corners=False).squeeze(1)
+        
+        # # ★ 修复 3：切除 2D 特征图因卷积/Swin带来的边缘平移伪影
+        # # 强制将最外围一圈 (或两圈) 的误差清零
+        # # err_2d[:, :, :2] = 0   # 左边缘
+        # # err_2d[:, :, -2:] = 0  # 右边缘
+        # # err_2d[:, :2, :] = 0   # 上边缘
+        # # err_2d[:, -2:, :] = 0  # 下边缘
+        
+        # # 3D Error Points: [B, N] (这是 N 个离散点的误差值)
+        # err_3d_points = torch.sum((xyz_recon_norm - F_gt_norm) ** 2, dim=2)
+        
+        # === 替换为 ===
+        err_2d = (1 - F.cosine_similarity(rgb_recon + 1e-8, rgb_target + 1e-8, dim=1)) + \
+                 self.l2_weight * torch.mean((rgb_recon - rgb_target) ** 2, dim=1)
+                 
         if err_2d.shape[-1] != self.img_size_val:
-            err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), 
-                                  mode='bilinear', align_corners=False).squeeze(1)
-        
-        # ★ 修复 3：切除 2D 特征图因卷积/Swin带来的边缘平移伪影
-        # 强制将最外围一圈 (或两圈) 的误差清零
-        err_2d[:, :, :2] = 0   # 左边缘
-        err_2d[:, :, -2:] = 0  # 右边缘
-        err_2d[:, :2, :] = 0   # 上边缘
-        err_2d[:, -2:, :] = 0  # 下边缘
-        
-        # 3D Error Points: [B, N] (这是 N 个离散点的误差值)
-        err_3d_points = torch.sum((xyz_recon_norm - F_gt_norm) ** 2, dim=2)
+            err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), mode='bilinear', align_corners=False).squeeze(1)
+
+        err_3d_points = (1 - F.cosine_similarity(xyz_recon + 1e-8, F_gt + 1e-8, dim=2)) + \
+                        self.l2_weight * torch.mean((xyz_recon - F_gt) ** 2, dim=2)
         
         # ---------------------------------------------------
         # 步骤 B: 空间映射 (Splatting) - 这一步绝对不能省！
@@ -733,11 +891,6 @@ class ReconFeatures(nn.Module):
         # ---------------------------------------------------
         # 步骤 C: 后处理与融合
         # ---------------------------------------------------
-        
-        # 2D 上采样 (如果 backbone 输出不是 224)
-        if err_2d.shape[-1] != self.img_size_val:
-            err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), 
-                                  mode='bilinear', align_corners=False).squeeze(1)
 
         if depth_map.dim() == 4:
             if depth_map.shape[1] == 3: depth_map = depth_map[:, 2, :, :]
@@ -750,15 +903,14 @@ class ReconFeatures(nn.Module):
         # ★ 完整的物体 Mask (一刀不剪，捍卫 Pixel AUC！)
         fg_mask_raw = (depth_map > batch_min_z + 1e-5).float()
         
-        # ★ 新增：向内腐蚀前景掩码 3 个像素，彻底切掉最边缘的插值红光！
-        bg_mask_raw = 1.0 - fg_mask_raw
-        eroded_bg_raw = F.max_pool2d(bg_mask_raw, kernel_size=7, stride=1, padding=3)
-        fg_mask_clean = 1.0 - eroded_bg_raw
+        # # ★ 新增：向内腐蚀前景掩码 3 个像素，彻底切掉最边缘的插值红光！
+        # bg_mask_raw = 1.0 - fg_mask_raw
+        # # eroded_bg_raw = F.max_pool2d(bg_mask_raw, kernel_size=7, stride=1, padding=3)
+        # # 改为轻度腐蚀，仅去除 1 个像素的极边缘噪点：
+        # eroded_bg_raw = F.max_pool2d(bg_mask_raw, kernel_size=3, stride=1, padding=1)
+        # fg_mask_clean = 1.0 - eroded_bg_raw
         
-        fg_mask = F.interpolate(fg_mask_clean, size=(self.img_size_val, self.img_size_val), mode='nearest').squeeze(1)
-        
-        err_2d = err_2d * fg_mask
-        err_3d_map = err_3d_map * fg_mask
+        # fg_mask = F.interpolate(fg_mask_clean, size=(self.img_size_val, self.img_size_val), mode='nearest').squeeze(1)
         
         # 高斯模糊 (平滑噪声)
         # err_2d_smooth = self.blur(err_2d.unsqueeze(1).cpu()).squeeze(1).to(self.device)
@@ -770,16 +922,36 @@ class ReconFeatures(nn.Module):
         err_3d_smooth = self.blur(err_3d_map.unsqueeze(1).cpu()).to(self.device)
         err_3d_smooth = err_3d_smooth.view(B, self.img_size_val, self.img_size_val)
         
+        # # ==========================================
+        # # ★ 终极逻辑：纯净均值相减 (Baseline Subtraction)
+        # # 减去训练集均值，消灭金属误报。用 ReLU 砍掉负值，只保留真正溢出的缺陷！
+        # # ==========================================
+        # err_2d_norm = F.relu(err_2d_smooth - self.net.err_2d_mean.to(self.device))
+        # err_3d_norm = F.relu(err_3d_smooth - self.net.err_3d_mean.to(self.device))
+        
+        # ================== D. ★ 终极奥义：鲁棒 Z-Score (Robust Z-Score) 异常放大器 ==================
+        std_2d = self.net.err_2d_std.to(self.device)
+        std_3d = self.net.err_3d_std.to(self.device)
+        
+        # ★ 修复：加入鲁棒保护垫 (Robust Epsilon)，彻底杜绝边缘误差爆炸！
+        # 提取当前特征图标准差的全局均值的一个比例（如 10%），外加基础防爆常数 1e-3
+        eps_2d = torch.clamp(std_2d.mean() * 0.1, min=1e-3)
+        eps_3d = torch.clamp(std_3d.mean() * 0.1, min=1e-3)
+        
+        # 使用 (误差 - 均值) / (标准差 + 保护垫)
+        err_2d_norm = F.relu(err_2d_smooth - self.net.err_2d_mean.to(self.device)) / (std_2d + eps_2d)
+        err_3d_norm = F.relu(err_3d_smooth - self.net.err_3d_mean.to(self.device)) / (std_3d + eps_3d)
+
         # ==========================================
-        # ★ 终极逻辑：纯净均值相减 (Baseline Subtraction)
-        # 减去训练集均值，消灭金属误报。用 ReLU 砍掉负值，只保留真正溢出的缺陷！
+        # ★ 黄金 5 像素宽容评估掩码 (kernel=11, padding=5)
+        # 拯救 Impact Damage 的边缘破损！
         # ==========================================
-        err_2d_norm = F.relu(err_2d_smooth - self.net.err_2d_mean.to(self.device))
-        err_3d_norm = F.relu(err_3d_smooth - self.net.err_3d_mean.to(self.device))
+        fg_mask_dilated = F.max_pool2d(fg_mask_raw, kernel_size=11, stride=1, padding=5)
+        fg_mask_eval = F.interpolate(fg_mask_dilated, size=(self.img_size_val, self.img_size_val), mode='nearest').squeeze(1)
 
         # 乘上前景掩码，确保背景绝对干净
-        err_2d_norm = err_2d_norm * fg_mask
-        err_3d_norm = err_3d_norm * fg_mask
+        err_2d_norm = err_2d_norm * fg_mask_eval
+        err_3d_norm = err_3d_norm * fg_mask_eval
 
         # 5. ★ 推理融合：直接相加 (等价于 alpha=0.5, beta=0.5)
         # 这样任何一个分支检测到的缺陷 (高误差) 都会被保留
@@ -787,9 +959,13 @@ class ReconFeatures(nn.Module):
 
         # ★ 6. 专门给 Image AUC 准备的【重度打分掩码】
         # 向内疯狂收缩 15 像素，确保 Image AUC 持续飙升！但不改变存下来的图！
-        bg_mask = 1.0 - fg_mask.unsqueeze(1)
-        eroded_bg = F.max_pool2d(bg_mask, kernel_size=11, stride=1, padding=5)
+        bg_mask = 1.0 - fg_mask_raw
+        # eroded_bg = F.max_pool2d(bg_mask, kernel_size=11, stride=1, padding=5)
+        eroded_bg = F.max_pool2d(bg_mask, kernel_size=5, stride=1, padding=2)
         score_mask = (1.0 - eroded_bg).squeeze(1).cpu()
+        
+        # ★ 取消疯狂腐蚀的 score_mask，直接使用原版前景 Mask，让边缘的 Impact Damage 也能得分！
+        # score_mask = fg_mask.cpu()
 
         # -------------------------
         # 7. 仿 RealIAD-D3：把 score 累积到 buffer 里
@@ -804,7 +980,13 @@ class ReconFeatures(nn.Module):
             # ========= 现在 fmap / gmap 都是 [Hg, Wg] =========
             # 算 Image AUC：套上重度掩码，取 max，保证 Image AUC 继续涨！
             fmap_score = fmap * score_mask[b]
-            img_score = float(fmap_score.max())
+            # ★ 修改前：img_score = float(fmap_score.max())
+            # ★ 修改后：使用 Top-K 平滑聚合，防止边缘单一的高频噪点让正常样本得分暴涨
+            fmap_flat = fmap_score.flatten()
+            # 动态计算 1% 的像素数量，如果图比较小至少保留 1 个点
+            k_val = max(1, int(fmap_flat.numel() * 0.01)) 
+            topk_vals, _ = torch.topk(fmap_flat, k_val)
+            img_score = float(topk_vals.mean())
             self.image_preds.append(img_score)
             self.image_labels.append(int(label[b]))
 
@@ -886,7 +1068,3 @@ class ReconFeatures(nn.Module):
 
         # au_pro, _ = calculate_au_pro(gts_np, preds_np)
         # self.au_pro = float(au_pro)
-
-
-
-
