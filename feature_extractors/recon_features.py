@@ -81,7 +81,17 @@ class FusionReconNet(nn.Module):
         # ★ 新增：终极修复 1 —— 升维投影层
         # 用于将解码器输出的 768 维特征升维回 1152 维，直面最纯正的物理几何真值！
         # ==========================================
-        self.xyz_out_proj = nn.Linear(self.rgb_feat_dim, self.xyz_token_dim)
+        # self.xyz_out_proj = nn.Linear(self.rgb_feat_dim, self.xyz_token_dim)
+        # ★ 终极修改 1：将预测目标直接变为 3 维物理坐标 (X, Y, Z)
+        # self.xyz_out_proj = nn.Linear(self.rgb_feat_dim, 3)
+        
+        # ==========================================
+        # ★ 完美架构：双头预测 (Dual-Head)
+        # 1. 语义头：负责重构 1152 维 PointMAE 特征，抓划痕
+        self.xyz_feat_head = nn.Linear(self.rgb_feat_dim, self.xyz_token_dim)
+        # 2. 坐标头：负责重构 3 维绝对物理坐标，抓形变
+        self.xyz_coord_head = nn.Linear(self.rgb_feat_dim, 3)
+        # ==========================================
         
         # Step 2.2: 潜在空间随机掩码
         # 维度要和你 PointMAE 投影后的维度一致 (768)
@@ -194,6 +204,10 @@ class FusionReconNet(nn.Module):
         self.register_buffer('err_2d_std', torch.ones(1, img_size, img_size))
         self.register_buffer('err_3d_mean', torch.zeros(1, img_size, img_size))
         self.register_buffer('err_3d_std', torch.ones(1, img_size, img_size))
+        
+        # ★ 新增：用于存储物理深度图的绝对基线
+        self.register_buffer('depth_mean', torch.zeros(1, 1, img_size, img_size))
+        self.register_buffer('depth_std', torch.ones(1, 1, img_size, img_size))
 
     def forward(self, rgb, xyz, ps):
         """
@@ -254,7 +268,15 @@ class FusionReconNet(nn.Module):
         # ★ 终极修复 2：激活 3D 几何推断（摧毁死区）
         # 直接拿 PointMAE 提取的、富含绝对空间形变信息的 1152 维特征作为真值 (F_gt)！
         # ==========================================
-        F_gt = xyz_tokens.detach() 
+        # F_gt = xyz_tokens.detach() 
+        # ==========================================
+        # ★ 终极修改 2：彻底抛弃语义特征，直接拿物理采样点 center (B, 1024, 3) 作为绝对真值！
+        # ==========================================
+        # F_gt = center.detach()
+        
+        # ★ 提取双真值 (都 detach 切断梯度)
+        F_feat_gt = xyz_tokens.detach()   # 1152 维语义真值
+        F_coord_gt = center.detach()      # 3 维坐标真值
         
         # 投影到 768 维度，作为网络内部处理（Mask 和 频域变换）的起点
         F_in_raw = self.xyz_proj(xyz_tokens)
@@ -363,9 +385,13 @@ class FusionReconNet(nn.Module):
         # ==========================================
         # ★ 终极修复 3：映射回 1152 维去计算损失
         # ==========================================
-        xyz_recon_final_out = self.xyz_out_proj(xyz_recon_feat)
+        # xyz_recon_final_out = self.xyz_out_proj(xyz_recon_feat)
         
-        return rgb_recon_feat, xyz_recon_final_out, rgb_feats_css, F_gt, loss_geo, U, mask, center, center_idx
+        # ★ 分别通过两个头输出
+        xyz_recon_feat_out = self.xyz_feat_head(xyz_recon_feat)   # [B, 1024, 1152]
+        xyz_recon_coord_out = self.xyz_coord_head(xyz_recon_feat) # [B, 1024, 3]
+        
+        return rgb_recon_feat, xyz_recon_feat_out, xyz_recon_coord_out, rgb_feats_css, F_feat_gt, F_coord_gt, loss_geo, U, mask, center, center_idx
 
 
 # ------------------------------------------------
@@ -539,6 +565,12 @@ class ReconFeatures(nn.Module):
         
         # 指标与可视化缓存（仿 RealIAD-D3 的 Method 风格）
         self.reset_buffers()
+        
+        
+        # ★ 终极调参中心：推理时控制三个模态得分上限的平衡系数
+        self.weight_2d = 1.0           # 2D 基础权重
+        self.weight_3d_feat = 2.0      # 3D 语义压制系数
+        self.weight_depth = 0.3        # 物理深度压制系数 (因为方差极小，极易爆炸，必须重度压制)
 
     def reset_buffers(self):
         #   """清空评估阶段用到的缓存（仿 RealIAD-D3 的 Method）"""
@@ -617,8 +649,8 @@ class ReconFeatures(nn.Module):
         cosine_loss = 1 - F.cosine_similarity(pred_safe, target_safe, dim=dim)
         
         # 2. L2 Loss (★ 核心修复：必须在 L2 归一化后计算，防止模型靠缩短向量长度作弊)
-        # pred_norm = F.normalize(pred, p=2, dim=dim)
-        # target_norm = F.normalize(target, p=2, dim=dim)
+        pred_norm = F.normalize(pred, p=2, dim=dim)
+        target_norm = F.normalize(target, p=2, dim=dim)
         
         l2_loss_raw = F.mse_loss(pred, target, reduction='none')
         
@@ -658,7 +690,7 @@ class ReconFeatures(nn.Module):
         # xyz_recon: 重建后的3D特征 [B, 1024, 768]
         # rgb_target: CSS后的2D特征 [B, 768, 28, 28]
         # xyz_target: 投影后的3D真值特征 [B, 1024, 768]
-        rgb_recon, xyz_recon, rgb_target, F_gt, loss_geo, U, mask, center, center_idx = self.net(rgb, xyz, ps)
+        rgb_recon, xyz_feat_recon, _ , rgb_target, F_feat_gt, _, loss_geo, U, mask, center, center_idx = self.net(rgb, xyz, ps)
 
         # ==========================================
         # ★ 核心大招：生成训练专用的 2D 损失掩码 (Loss Masking)
@@ -697,7 +729,17 @@ class ReconFeatures(nn.Module):
         # 文档: "Lrec = |Fpred - Fgt|^2"
         # 3D (Channel维度是 dim=2)
         # loss_3d = self.compute_hybrid_loss(xyz_recon, F_gt.detach(),dim = 2)
-        loss_3d = self.compute_hybrid_loss(xyz_recon, F_gt.detach(),dim = 2, mask=mask)
+        # loss_3d = self.compute_hybrid_loss(xyz_recon, F_gt.detach(),dim = 2, mask=mask)
+        # ==========================================
+        # ★ 终极修改 3：3D Loss 变为纯粹的物理距离误差 (欧氏距离平方)
+        # ==========================================
+        # l2_loss_3d_raw = F.mse_loss(xyz_recon, F_gt.detach(), reduction='none') # [B, 1024, 3]
+        # l2_loss_3d = l2_loss_3d_raw.mean(dim=-1) # [B, 1024]
+        # loss_3d = (l2_loss_3d * mask).sum() / (mask.sum() + 1e-5)
+        
+        # 2. 3D 语义 Loss (带 F.normalize，防止 0.003 坍缩)
+        loss_3d_feat = self.compute_hybrid_loss(xyz_feat_recon, F_feat_gt, dim=2, mask=mask)
+        loss_3d = loss_3d_feat 
         
         # # 3. ★ OT 计算权重 (传入 detach 防止作弊)
         # # 只有在训练时，我们希望"避重就轻"，让模型先学容易的，稳步收敛
@@ -710,19 +752,11 @@ class ReconFeatures(nn.Module):
         # ---------- 换用绝对稳定的固定权重 ----------
         # 因为 2D Loss 稍微大一点点，1:1 或者 1:2 都是极佳的，这里推荐 1:1 稳如泰山
         w_alpha = 1.0
-        w_beta = 1.0
+        w_beta = 30.0
     
         weighted_loss = w_alpha * loss_2d + w_beta * loss_3d
         total_loss = weighted_loss + self.lambda_geo * loss_geo
         
-        # return {
-        #     "loss": total_loss,
-        #     "l2d": loss_2d.item(),
-        #     "l3d": loss_3d.item(),
-        #     "geo": loss_geo.item(),
-        #     "alpha": w_alpha.item(),
-        #     "beta": w_beta.item()
-        # }
         return {
             "loss": total_loss,
             "l2d": loss_2d.item(),
@@ -731,7 +765,7 @@ class ReconFeatures(nn.Module):
             "alpha": w_alpha,
             "beta": w_beta
         }
-
+        
     @torch.no_grad()
     def build_error_statistics(self, train_loader):
         """
@@ -740,7 +774,10 @@ class ReconFeatures(nn.Module):
         """
         self.net.eval()
         err_2d_list = []
-        err_3d_list = []
+        # err_3d_list = []
+        err_3d_feat_list = []
+        depth_list = []
+        
         
         from tqdm import tqdm
         print("\n[Post-Training] Building Pixel-wise Z-Score Baseline...")
@@ -749,12 +786,12 @@ class ReconFeatures(nn.Module):
             rgb, xyz, ps = rgb.to(self.device), xyz.to(self.device), ps.to(self.device)
             B = rgb.size(0)
 
-            rgb_recon, xyz_recon, rgb_target, F_gt, _, _, _, _, center_idx = self.net(rgb, xyz, ps)
+            rgb_recon, xyz_feat_recon, _, rgb_target, F_feat_gt, _, _, _, _, _, center_idx = self.net(rgb, xyz, ps)
 
             # 1. 算 Raw 误差
             # === 彻底替换掉这 6 行旧代码 ===
-            # rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)
-            # rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
+            rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)
+            rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
             # xyz_recon_norm = F.normalize(xyz_recon, p=2, dim=2)
             # F_gt_norm = F.normalize(F_gt, p=2, dim=2)
 
@@ -768,33 +805,48 @@ class ReconFeatures(nn.Module):
             
             # 2D 误差图计算 (不归一化，保留绝对幅值)
             err_2d = (1 - F.cosine_similarity(rgb_recon + 1e-8, rgb_target + 1e-8, dim=1)) + \
-                     self.l2_weight * torch.mean((rgb_recon - rgb_target) ** 2, dim=1)
+                     self.l2_weight * torch.mean((rgb_recon_norm - rgb_target_norm) ** 2, dim=1)
             
             if err_2d.shape[-1] != self.img_size_val:
                 err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), mode='bilinear', align_corners=False).squeeze(1)
 
-            # 3D 误差图计算 (不归一化，捕捉形变带来的空间偏移)
-            err_3d_points = (1 - F.cosine_similarity(xyz_recon + 1e-8, F_gt + 1e-8, dim=2)) + \
-                            self.l2_weight * torch.mean((xyz_recon - F_gt) ** 2, dim=2)
-            # ★ 此处附带了你的 3D 偏移修复！
-            err_3d_map = splat_3d_error_to_2d_exact(err_3d_points, center_idx, self.img_size_val)
+            # ★ 3D 误差双重暴击
+            # A. 语义误差：抓划痕
+            xyz_feat_norm = F.normalize(xyz_feat_recon, p=2, dim=2)
+            F_feat_gt_norm = F.normalize(F_feat_gt, p=2, dim=2)
+            err_3d_feat = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
+                          self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+            
+            err_3d_map = splat_3d_error_to_2d_exact(err_3d_feat, center_idx, self.img_size_val)
 
-            # 2. 收集平滑后的空间特征
+            # 3. 提取物理深度真值 (★ 为模板匹配建立基线)
+            depth_gt = depth_map.to(self.device)
+            if depth_gt.dim() == 4:
+                if depth_gt.shape[1] == 3: depth_gt = depth_gt[:, 2:3, :, :]
+                elif depth_gt.shape[-1] == 3: depth_gt = depth_gt[:, :, :, 2:3]
+                else: depth_gt = depth_gt.mean(dim=1, keepdim=True)
+            if depth_gt.dim() == 3:
+                depth_gt = depth_gt.unsqueeze(1)
+                
             err_2d_smooth = self.blur(err_2d.unsqueeze(1).cpu()).squeeze(1)
             err_3d_smooth = self.blur(err_3d_map.unsqueeze(1).cpu()).squeeze(1)
 
             err_2d_list.append(err_2d_smooth)
-            err_3d_list.append(err_3d_smooth)
+            err_3d_feat_list.append(err_3d_smooth)
+            depth_list.append(depth_gt.cpu())
             
         all_err_2d = torch.cat(err_2d_list, dim=0) # [Total_Samples, H, W]
-        all_err_3d = torch.cat(err_3d_list, dim=0)
+        all_err_3d_feat = torch.cat(err_3d_feat_list, dim=0)
+        all_depth = torch.cat(depth_list, dim=0)
 
         # 3. 注入模型的“记忆”中
         self.net.err_2d_mean.copy_(all_err_2d.mean(dim=0, keepdim=True))
         self.net.err_2d_std.copy_(all_err_2d.std(dim=0, keepdim=True) + 1e-5)
-        self.net.err_3d_mean.copy_(all_err_3d.mean(dim=0, keepdim=True))
-        self.net.err_3d_std.copy_(all_err_3d.std(dim=0, keepdim=True) + 1e-5)
-        print("Baseline established and locked into model registry!")
+        self.net.err_3d_mean.copy_(all_err_3d_feat.mean(dim=0, keepdim=True))
+        self.net.err_3d_std.copy_(all_err_3d_feat.std(dim=0, keepdim=True) + 1e-5)
+        self.net.depth_mean.copy_(all_depth.mean(dim=0, keepdim=True))
+        self.net.depth_std.copy_(all_depth.std(dim=0, keepdim=True) + 1e-5)
+        print("Baseline and Physical Depth Template established and locked!")
 
 
     # -----------------------
@@ -829,7 +881,7 @@ class ReconFeatures(nn.Module):
         # -------------------------
         # 3. 前向重建（注意要把 ps 也传进去）
         # -------------------------
-        rgb_recon, xyz_recon, rgb_target, F_gt, _, _, _, center, center_idx = self.net(rgb, xyz, ps)
+        rgb_recon, xyz_feat_recon, _, rgb_target, F_feat_gt, _, _, _, _, _, center_idx = self.net(rgb, xyz, ps)
         # rgb_recon: [B, 3, H, W]
         # xyz_recon: [B, 1, H, W]
         # === 调试打印 ===
@@ -844,8 +896,8 @@ class ReconFeatures(nn.Module):
         # ---------------------------------------------------
         
         # # 1. L2 归一化 (解决量级差异的关键)
-        # rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)   # [B, C, H, W]
-        # rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
+        rgb_recon_norm = F.normalize(rgb_recon, p=2, dim=1)   # [B, C, H, W]
+        rgb_target_norm = F.normalize(rgb_target, p=2, dim=1)
         
         # xyz_recon_norm = F.normalize(xyz_recon, p=2, dim=2)   # [B, N, C]
         # F_gt_norm = F.normalize(F_gt, p=2, dim=2)
@@ -869,14 +921,17 @@ class ReconFeatures(nn.Module):
         
         # === 替换为 ===
         err_2d = (1 - F.cosine_similarity(rgb_recon + 1e-8, rgb_target + 1e-8, dim=1)) + \
-                 self.l2_weight * torch.mean((rgb_recon - rgb_target) ** 2, dim=1)
+                 self.l2_weight * torch.mean((rgb_recon_norm - rgb_target_norm) ** 2, dim=1)
                  
         if err_2d.shape[-1] != self.img_size_val:
             err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), mode='bilinear', align_corners=False).squeeze(1)
 
-        err_3d_points = (1 - F.cosine_similarity(xyz_recon + 1e-8, F_gt + 1e-8, dim=2)) + \
-                        self.l2_weight * torch.mean((xyz_recon - F_gt) ** 2, dim=2)
-        
+        # 3D 语义 + Z轴坐标双重误差
+        xyz_feat_norm = F.normalize(xyz_feat_recon, p=2, dim=2)
+        F_feat_gt_norm = F.normalize(F_feat_gt, p=2, dim=2)
+        err_3d_feat = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
+                      self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+                      
         # ---------------------------------------------------
         # 步骤 B: 空间映射 (Splatting) - 这一步绝对不能省！
         # ---------------------------------------------------
@@ -886,22 +941,26 @@ class ReconFeatures(nn.Module):
         # err_3d_map = splat_3d_error_to_2d(err_3d_points, center, self.img_size_val)
         # ★ 2. 替换旧的调用方法
         # 抛弃原来按坐标乱投的 err_3d_map = splat_3d_error_to_2d(err_3d_points, center, self.img_size_val)
-        err_3d_map = splat_3d_error_to_2d_exact(err_3d_points, center_idx, self.img_size_val)
+        err_3d_map = splat_3d_error_to_2d_exact(err_3d_feat, center_idx, self.img_size_val)
 
         # ---------------------------------------------------
         # 步骤 C: 后处理与融合
         # ---------------------------------------------------
 
-        if depth_map.dim() == 4:
-            if depth_map.shape[1] == 3: depth_map = depth_map[:, 2, :, :]
-            elif depth_map.shape[-1] == 3: depth_map = depth_map[:, :, :, 2]
-            else: depth_map = depth_map.mean(dim=1)
-        if depth_map.dim() == 3:
-            depth_map = depth_map.unsqueeze(1)
+        # -------------------------
+        # 2. 提取前景掩码与平滑
+        # -------------------------
+        depth_for_eval = depth_map.to(self.device)
+        if depth_for_eval.dim() == 4:
+            if depth_for_eval.shape[1] == 3: depth_for_eval = depth_for_eval[:, 2:3, :, :]
+            elif depth_for_eval.shape[-1] == 3: depth_for_eval = depth_for_eval[:, :, :, 2:3]
+            else: depth_for_eval = depth_for_eval.mean(dim=1, keepdim=True)
+        if depth_for_eval.dim() == 3:
+            depth_for_eval = depth_for_eval.unsqueeze(1)
             
-        batch_min_z = depth_map.view(B, -1).min(dim=1)[0].view(B, 1, 1, 1)
+        batch_min_z = depth_for_eval.view(B, -1).min(dim=1)[0].view(B, 1, 1, 1)
         # ★ 完整的物体 Mask (一刀不剪，捍卫 Pixel AUC！)
-        fg_mask_raw = (depth_map > batch_min_z + 1e-5).float()
+        fg_mask_raw = (depth_for_eval > batch_min_z + 1e-5).float()
         
         # # ★ 新增：向内腐蚀前景掩码 3 个像素，彻底切掉最边缘的插值红光！
         # bg_mask_raw = 1.0 - fg_mask_raw
@@ -931,16 +990,23 @@ class ReconFeatures(nn.Module):
         
         # ================== D. ★ 终极奥义：鲁棒 Z-Score (Robust Z-Score) 异常放大器 ==================
         std_2d = self.net.err_2d_std.to(self.device)
-        std_3d = self.net.err_3d_std.to(self.device)
+        std_3d_feat = self.net.err_3d_std.to(self.device)
         
         # ★ 修复：加入鲁棒保护垫 (Robust Epsilon)，彻底杜绝边缘误差爆炸！
         # 提取当前特征图标准差的全局均值的一个比例（如 10%），外加基础防爆常数 1e-3
         eps_2d = torch.clamp(std_2d.mean() * 0.1, min=1e-3)
-        eps_3d = torch.clamp(std_3d.mean() * 0.1, min=1e-3)
+        eps_3d = torch.clamp(std_3d_feat.mean() * 0.1, min=1e-3)
         
         # 使用 (误差 - 均值) / (标准差 + 保护垫)
         err_2d_norm = F.relu(err_2d_smooth - self.net.err_2d_mean.to(self.device)) / (std_2d + eps_2d)
-        err_3d_norm = F.relu(err_3d_smooth - self.net.err_3d_mean.to(self.device)) / (std_3d + eps_3d)
+        err_3d_feat_norm = F.relu(err_3d_smooth - self.net.err_3d_mean.to(self.device)) / (std_3d_feat + eps_3d)
+
+        # B. ★ 物理深度模板匹配对齐 (彻底取代了之前崩溃的坐标系)
+        std_depth = self.net.depth_std.to(self.device)
+        eps_depth = torch.clamp(std_depth.mean() * 0.1, min=1e-3)
+        
+        err_depth_raw = torch.abs(depth_for_eval - self.net.depth_mean.to(self.device))
+        err_depth_norm = err_depth_raw.squeeze(1) / (std_depth.squeeze(1) + eps_depth)
 
         # ==========================================
         # ★ 黄金 5 像素宽容评估掩码 (kernel=11, padding=5)
@@ -951,11 +1017,18 @@ class ReconFeatures(nn.Module):
 
         # 乘上前景掩码，确保背景绝对干净
         err_2d_norm = err_2d_norm * fg_mask_eval
-        err_3d_norm = err_3d_norm * fg_mask_eval
+        err_3d_feat_norm = err_3d_feat_norm * fg_mask_eval
+        err_depth_norm = err_depth_norm * fg_mask_eval
 
         # 5. ★ 推理融合：直接相加 (等价于 alpha=0.5, beta=0.5)
         # 这样任何一个分支检测到的缺陷 (高误差) 都会被保留
-        fused = err_2d_norm + err_3d_norm
+        # fused = err_2d_norm + 0.05 * err_3d_norm
+        # ★ 终极融合：加上 3D 压制系数，防止 3D 高分吞噬 2D 划痕！
+        # fused = err_2d_norm + self.zscore_3d_suppress * err_3d_norm
+        # D. ★ 终极三剑合璧 (带压制系数，防止深度异常吞噬 2D 划痕)
+        fused = self.weight_2d * err_2d_norm + \
+                self.weight_3d_feat * err_3d_feat_norm + \
+                self.weight_depth * err_depth_norm
 
         # ★ 6. 专门给 Image AUC 准备的【重度打分掩码】
         # 向内疯狂收缩 15 像素，确保 Image AUC 持续飙升！但不改变存下来的图！
@@ -999,7 +1072,7 @@ class ReconFeatures(nn.Module):
             
             # --- 保存单独的 Map ---
             self.maps_2d.append(err_2d_norm[b].clone())
-            self.maps_3d.append(err_3d_norm[b].clone())
+            self.maps_3d.append(err_3d_feat_norm[b].clone())
 
             # 为可视化缓存对应的 rgb / depth / ps
             if isinstance(sample, (tuple, list)):
@@ -1068,3 +1141,7 @@ class ReconFeatures(nn.Module):
 
         # au_pro, _ = calculate_au_pro(gts_np, preds_np)
         # self.au_pro = float(au_pro)
+
+
+
+
