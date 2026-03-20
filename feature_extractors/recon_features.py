@@ -294,11 +294,11 @@ class FusionReconNet(nn.Module):
             # 工业异常检测的常见做法是：推理时也掩码，看模型能不能修补回来。
             # 如果你的逻辑是“重构误差”，那么测试时也需要掩码。
             # 根据 PointMAE 原理，测试时通常也进行掩码重建。
-            F_in, mask = self.masking_module(F_in_raw)
+            # F_in, mask = self.masking_module(F_in_raw)
             
             # 如果你想测试时全量输入(不掩码)，可以用:
-            # F_in = F_gt
-            # mask = torch.zeros_like(F_gt[:,:,0])
+            F_in = F_in_raw
+            mask = torch.zeros(B, F_in_raw.shape[1], device=self.device)
         
         # ==========================================
         # ★ Phase 3 & 4 接口准备
@@ -483,52 +483,77 @@ class FusionReconNet(nn.Module):
 #     error_map = F.interpolate(error_map_small, size=(img_size, img_size), mode='bilinear', align_corners=False)
     
 #     return error_map.squeeze(1)
+# def splat_3d_error_to_2d_exact(errors, center_idx, img_size):
+#     B, N = errors.shape
+    
+#     # 1. 降采样映射到低分辨率特征网格 (28x28)
+#     small_size = 28
+#     scale = img_size / small_size  # 224 / 28 = 8.0
+    
+#     y = center_idx // img_size
+#     x = center_idx % img_size
+    
+#     # 向下取整映射到 28x28 对应的索引
+#     y_small = torch.clamp((y.float() / scale).long(), 0, small_size - 1)
+#     x_small = torch.clamp((x.float() / scale).long(), 0, small_size - 1)
+#     idx_small = y_small * small_size + x_small
+    
+#     error_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
+#     count_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
+    
+#     valid_mask = (center_idx > 0).float()
+#     errors_clean = errors * valid_mask
+    
+#     # 在 28x28 网格上累加误差
+#     error_map_small.scatter_add_(1, idx_small.long(), errors_clean)
+#     count_map_small.scatter_add_(1, idx_small.long(), torch.ones_like(valid_mask))
+    
+#     # 求平均
+#     mask = count_map_small > 0
+#     error_map_small[mask] /= count_map_small[mask]
+    
+#     error_map_small = error_map_small.view(B, 1, small_size, small_size)
+#     count_map_small = count_map_small.view(B, 1, small_size, small_size)
+    
+#     # ==========================================
+#     # ★ 终极收缩：智能空洞填补 (Smart Hole-Filling)
+#     # 只对没有采到点的空洞(0值区)进行邻域借值，绝不向外膨胀原本的高亮缺陷！
+#     # ==========================================
+#     empty_mask = (count_map_small == 0).float()
+#     error_map_dilated = F.max_pool2d(error_map_small, kernel_size=3, stride=1, padding=1)
+    
+#     # 有点的地方保持原始锐利度，只有空洞才会加上膨胀值
+#     error_map_small = error_map_small + error_map_dilated * empty_mask
+    
+#     # 3. 终极平滑：双线性插值放大回 224x224
+#     error_map = F.interpolate(error_map_small, size=(img_size, img_size), mode='bilinear', align_corners=False)
+    
+#     return error_map.squeeze(1)
 def splat_3d_error_to_2d_exact(errors, center_idx, img_size):
     B, N = errors.shape
     
-    # 1. 降采样映射到低分辨率特征网格 (28x28)
-    small_size = 28
-    scale = img_size / small_size  # 224 / 28 = 8.0
+    # 1. 直接在 224x224 的绝对分辨率画布上初始化
+    error_map = torch.zeros((B, img_size * img_size), device=errors.device)
     
-    y = center_idx // img_size
-    x = center_idx % img_size
-    
-    # 向下取整映射到 28x28 对应的索引
-    y_small = torch.clamp((y.float() / scale).long(), 0, small_size - 1)
-    x_small = torch.clamp((x.float() / scale).long(), 0, small_size - 1)
-    idx_small = y_small * small_size + x_small
-    
-    error_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
-    count_map_small = torch.zeros((B, small_size * small_size), device=errors.device)
-    
+    # 过滤掉无效点 (center_idx == 0 的 padding 区域)
     valid_mask = (center_idx > 0).float()
     errors_clean = errors * valid_mask
     
-    # 在 28x28 网格上累加误差
-    error_map_small.scatter_add_(1, idx_small.long(), errors_clean)
-    count_map_small.scatter_add_(1, idx_small.long(), torch.ones_like(valid_mask))
+    # 2. ★ 核心突围：直接映射绝对位置，坚决不求平均！
+    # 将稀疏的误差峰值像钉钉子一样原封不动地砸在 224x224 画布上
+    error_map.scatter_(1, center_idx.long(), errors_clean)
+    error_map = error_map.view(B, 1, img_size, img_size)
     
-    # 求平均
-    mask = count_map_small > 0
-    error_map_small[mask] /= count_map_small[mask]
+    # 3. ★ 峰值膨胀连通 (Dilation)
+    # 因为 1024 个点在 224x224 上是非常稀疏的星空状，
+    # 使用 MaxPool 可以把那 1-2 个极亮的高分点直接扩张成一个红色的区块，而不被周围的 0 值稀释。
+    # kernel_size=11 确保 1024 个点扩张后能无缝覆盖整个工件表面
+    error_map_dilated = F.max_pool2d(error_map, kernel_size=11, stride=1, padding=5)
     
-    error_map_small = error_map_small.view(B, 1, small_size, small_size)
-    count_map_small = count_map_small.view(B, 1, small_size, small_size)
+    # 4. 轻柔化边缘，消除方块马赛克感
+    error_map_smooth = F.avg_pool2d(error_map_dilated, kernel_size=5, stride=1, padding=2)
     
-    # ==========================================
-    # ★ 终极收缩：智能空洞填补 (Smart Hole-Filling)
-    # 只对没有采到点的空洞(0值区)进行邻域借值，绝不向外膨胀原本的高亮缺陷！
-    # ==========================================
-    empty_mask = (count_map_small == 0).float()
-    error_map_dilated = F.max_pool2d(error_map_small, kernel_size=3, stride=1, padding=1)
-    
-    # 有点的地方保持原始锐利度，只有空洞才会加上膨胀值
-    error_map_small = error_map_small + error_map_dilated * empty_mask
-    
-    # 3. 终极平滑：双线性插值放大回 224x224
-    error_map = F.interpolate(error_map_small, size=(img_size, img_size), mode='bilinear', align_corners=False)
-    
-    return error_map.squeeze(1)
+    return error_map_smooth.squeeze(1)
 
 # ------------------------------------------------
 # 3. 重建式异常检测封装
@@ -1008,12 +1033,15 @@ class ReconFeatures(nn.Module):
         err_depth_raw = torch.abs(depth_for_eval - self.net.depth_mean.to(self.device))
         err_depth_norm = err_depth_raw.squeeze(1) / (std_depth.squeeze(1) + eps_depth)
 
+        
         # ==========================================
         # ★ 黄金 5 像素宽容评估掩码 (kernel=11, padding=5)
         # 拯救 Impact Damage 的边缘破损！
         # ==========================================
         fg_mask_dilated = F.max_pool2d(fg_mask_raw, kernel_size=11, stride=1, padding=5)
         fg_mask_eval = F.interpolate(fg_mask_dilated, size=(self.img_size_val, self.img_size_val), mode='nearest').squeeze(1)
+        
+
 
         # 乘上前景掩码，确保背景绝对干净
         err_2d_norm = err_2d_norm * fg_mask_eval
@@ -1141,7 +1169,3 @@ class ReconFeatures(nn.Module):
 
         # au_pro, _ = calculate_au_pro(gts_np, preds_np)
         # self.au_pro = float(au_pro)
-
-
-
-
