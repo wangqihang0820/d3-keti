@@ -253,6 +253,7 @@ class FusionReconNet(nn.Module):
         # -------------------------
         # 4) 3D 编码：Point_MAE
         # -------------------------
+        # print("xyz.shape:",xyz.shape)
         xyz_tokens, center, ori_idx, center_idx = self.encoder.xyz_backbone(xyz)
         # ==========================================
         # ★ 新增: Phase 1 (Step 1.2 - 1.4)
@@ -260,6 +261,8 @@ class FusionReconNet(nn.Module):
         # 输出: U (基底), loss_geo (几何正则化损失)
         # ==========================================
         U, loss_geo, knn_idx = self.shared_basis(center, ps, center_idx)
+        
+        # print("U.shape:",U.shape)
         
         # xyz_tokens: (B, 1152, G)  G = num_group = 64
         xyz_tokens = xyz_tokens.transpose(1, 2).contiguous()          # (B, G, 1152)
@@ -278,6 +281,8 @@ class FusionReconNet(nn.Module):
         F_feat_gt = xyz_tokens.detach()   # 1152 维语义真值
         F_coord_gt = center.detach()      # 3 维坐标真值
         
+        # print("F_feat_gt.shape:",F_feat_gt.shape)
+        
         # 投影到 768 维度，作为网络内部处理（Mask 和 频域变换）的起点
         F_in_raw = self.xyz_proj(xyz_tokens)
 
@@ -294,11 +299,11 @@ class FusionReconNet(nn.Module):
             # 工业异常检测的常见做法是：推理时也掩码，看模型能不能修补回来。
             # 如果你的逻辑是“重构误差”，那么测试时也需要掩码。
             # 根据 PointMAE 原理，测试时通常也进行掩码重建。
-            # F_in, mask = self.masking_module(F_in_raw)
+            F_in, mask = self.masking_module(F_in_raw)
             
             # 如果你想测试时全量输入(不掩码)，可以用:
-            F_in = F_in_raw
-            mask = torch.zeros(B, F_in_raw.shape[1], device=self.device)
+            # F_in = F_in_raw
+            # mask = torch.zeros(B, F_in_raw.shape[1], device=self.device)
         
         # ==========================================
         # ★ Phase 3 & 4 接口准备
@@ -380,7 +385,7 @@ class FusionReconNet(nn.Module):
         rgb_recon_feat = self.recon_2d(rgb_in_recon)
         # 3D 重建
         # Input: [B, G, 768] -> Output: [B, G, 768] -> Fpred
-        xyz_recon_feat = self.recon_3d(xyz_updated)
+        xyz_recon_feat = self.recon_3d(xyz_updated,center)
         
         # ==========================================
         # ★ 终极修复 3：映射回 1152 维去计算损失
@@ -902,16 +907,34 @@ class ReconFeatures(nn.Module):
         depth_map = depth_map.to(self.device)
         ps = ps.to(self.device)
         B = rgb.size(0)
+        
+        # ==========================================
+        # ★ 新增：多重随机掩码融合 (Ensemble Masking)
+        # ==========================================
+        ensemble_runs = 4  # 执行 4 次不同的随机 Mask
+        err_3d_feat_ensemble = 0
+
+        for _ in range(ensemble_runs):
+            # 每次前向传播都会因为 LatentRandomMasking 产生不同的掩盖区域
+            rgb_recon, xyz_feat_recon, _, rgb_target, F_feat_gt, _, _, _, _, _, center_idx = self.net(rgb, xyz, ps)
+            
+            xyz_feat_norm = F.normalize(xyz_feat_recon, p=2, dim=2)
+            F_feat_gt_norm = F.normalize(F_feat_gt, p=2, dim=2)
+            
+            # 累加当次的 3D 重建误差
+            err_3d_feat_current = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
+                                  self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+            err_3d_feat_ensemble += err_3d_feat_current
+
+        # 求取 3D 误差期望值
+        err_3d_feat = err_3d_feat_ensemble / ensemble_runs
 
         # -------------------------
         # 3. 前向重建（注意要把 ps 也传进去）
         # -------------------------
-        rgb_recon, xyz_feat_recon, _, rgb_target, F_feat_gt, _, _, _, _, _, center_idx = self.net(rgb, xyz, ps)
+        # rgb_recon, xyz_feat_recon, _, rgb_target, F_feat_gt, _, _, _, _, _, center_idx = self.net(rgb, xyz, ps)
         # rgb_recon: [B, 3, H, W]
         # xyz_recon: [B, 1, H, W]
-        # === 调试打印 ===
-        # print(f"Center Range - X: [{center[..., 0].min().item():.2f}, {center[..., 0].max().item():.2f}]")
-        # print(f"Center Range - Y: [{center[..., 1].min().item():.2f}, {center[..., 1].max().item():.2f}]")
 
         # -------------------------
         # 4. 重建误差 map
@@ -952,10 +975,10 @@ class ReconFeatures(nn.Module):
             err_2d = F.interpolate(err_2d.unsqueeze(1), size=(self.img_size_val, self.img_size_val), mode='bilinear', align_corners=False).squeeze(1)
 
         # 3D 语义 + Z轴坐标双重误差
-        xyz_feat_norm = F.normalize(xyz_feat_recon, p=2, dim=2)
-        F_feat_gt_norm = F.normalize(F_feat_gt, p=2, dim=2)
-        err_3d_feat = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
-                      self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+        # xyz_feat_norm = F.normalize(xyz_feat_recon, p=2, dim=2)
+        # F_feat_gt_norm = F.normalize(F_feat_gt, p=2, dim=2)
+        # err_3d_feat = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
+        #               self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
                       
         # ---------------------------------------------------
         # 步骤 B: 空间映射 (Splatting) - 这一步绝对不能省！
@@ -1038,7 +1061,7 @@ class ReconFeatures(nn.Module):
         # ★ 黄金 5 像素宽容评估掩码 (kernel=11, padding=5)
         # 拯救 Impact Damage 的边缘破损！
         # ==========================================
-        fg_mask_dilated = F.max_pool2d(fg_mask_raw, kernel_size=11, stride=1, padding=5)
+        fg_mask_dilated = F.max_pool2d(fg_mask_raw, kernel_size=7, stride=1, padding=3)
         fg_mask_eval = F.interpolate(fg_mask_dilated, size=(self.img_size_val, self.img_size_val), mode='nearest').squeeze(1)
         
 
