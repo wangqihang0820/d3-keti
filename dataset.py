@@ -10,6 +10,120 @@ import math
 import cv2
 import argparse
 from matplotlib import pyplot as plt
+import logging
+
+from PIL import Image
+
+
+# ★ 终极护盾 2：彻底切断任何底层 util 偷偷调用的 OpenCV 多线程
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+def robust_read_image(path, mode='RGB'):
+    """
+    终极双引擎容错读取：PIL 主力防崩，OpenCV 替补强读！
+    """
+    try:
+        # 【主引擎】：优先使用最安全的 PIL 读取
+        with Image.open(path) as img:
+            return img.convert(mode).copy()
+            
+    except Exception as e:
+        # PIL 挑食报错了！瞬间切入副引擎
+        logging.warning(f"⚠️ PIL 拒绝读取 {path}，正在启用 OpenCV 替补引擎强读...")
+        try:
+            # 【副引擎】：OpenCV 无视文件头瑕疵，强行读取像素
+            img_cv = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img_cv is None:
+                raise ValueError("OpenCV 也无法解析该文件。")
+            
+            # 转换通道格式以匹配要求
+            if mode == 'RGB':
+                if len(img_cv.shape) == 2:
+                    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_GRAY2RGB)
+                elif img_cv.shape[2] == 3:
+                    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+                elif img_cv.shape[2] == 4:
+                    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2RGB)
+            elif mode == 'L':
+                if len(img_cv.shape) == 3:
+                    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+                elif len(img_cv.shape) == 4:
+                    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2GRAY)
+            
+            # 把强读出来的 numpy 矩阵包装成干净的 PIL 对象交差
+            return Image.fromarray(img_cv)
+            
+        except Exception as cv_e:
+            # 万一真的是 0 字节烂图，触发最后一道免死金牌
+            logging.error(f"❌ 双引擎均读取失败: {path}，返回全黑图防止训练中断。")
+            if mode == 'RGB':
+                return Image.new('RGB', (224, 224), (0, 0, 0))
+            else:
+                return Image.new('L', (224, 224), 0)
+
+
+def get_foreground_fps_pc(organized_pc, num_points=4096):
+    """
+    在 CPU 端执行前景提取与 Farthest Point Sampling。
+    保证输出的 Tensor 完美对齐 [4096, 3]，并且彻底抛弃背景。
+    """
+    z_channel = organized_pc[:, :, 2]
+    min_z = np.nanmin(z_channel)
+    
+    # 1. 提取前景 (Z轴高于背景)
+    fg_mask = z_channel > (min_z + 1e-5)
+    fg_points = organized_pc[fg_mask]
+    
+    # ★ 新增：记录全局一维索引 (0 ~ 50175)
+    global_indices = np.arange(organized_pc.shape[0] * organized_pc.shape[1])
+    fg_global_indices = global_indices[fg_mask.flatten()]
+    
+    N = fg_points.shape[0]
+    if N == 0:
+        return np.zeros((num_points, 3), dtype=np.float32)
+        
+    # 2. 如果前景点不足，有放回随机重采样补齐
+    if N < num_points:
+        pad_idx = np.random.choice(N, num_points - N, replace=True)
+        fg_points = np.concatenate([fg_points, fg_points[pad_idx]], axis=0)
+        # ★ 索引同步补齐！
+        fg_global_indices = np.concatenate([fg_global_indices, fg_global_indices[pad_idx]], axis=0)
+        N = num_points
+        
+    # 3. 随机降采样到 10000 点 (极大加速 CPU 端的 FPS 计算速度)
+    if N > 10000:
+        rand_idx = np.random.choice(N, 10000, replace=False)
+        fg_points = fg_points[rand_idx]
+        # ★ 索引同步降采样！
+        fg_global_indices = fg_global_indices[rand_idx]
+        N = 10000
+        
+    # 4. Numpy 版 FPS (避免 DataLoader 中的 CUDA 多进程报错)
+    centroids = np.zeros(num_points, dtype=int)
+    distance = np.ones(N, dtype=np.float32) * 1e10
+    farthest = np.random.randint(0, N)
+    
+    for i in range(num_points):
+        centroids[i] = farthest
+        centroid = fg_points[farthest, :]
+        dist = np.sum((fg_points - centroid) ** 2, axis=-1)
+        distance = np.minimum(distance, dist)
+        farthest = np.argmax(distance)
+        
+    sampled_points = fg_points[centroids]
+    # ★ 新增：提取这 4096 个点对应的原始全局索引
+    sampled_indices = fg_global_indices[centroids]
+    
+    # 5. 去中心化与极值归一化 (直接在这里将其转移到单位球，网络内就不需要再做了！)
+    center_of_mass = np.mean(sampled_points, axis=0, keepdims=True)
+    sampled_points = sampled_points - center_of_mass
+    max_dist = np.max(np.linalg.norm(sampled_points, axis=-1)) + 1e-5
+    sampled_points = sampled_points / max_dist
+    
+    return sampled_points.astype(np.float32), sampled_indices.astype(np.int64)
 
 # 包括了多个自定义数据集类，数据预处理函数，以及用于训练和验证的数据加载函数
 
@@ -260,13 +374,15 @@ class TrainDataset(BaseAnomalyDetectionDataset):
         rgb_path = img_path[0]
         tiff_path = img_path[1]
         ps_path = img_path[2]
-        img = Image.open(rgb_path).convert('RGB')
+        # img = Image.open(rgb_path).convert('RGB')
+        img = robust_read_image(rgb_path, mode='RGB')
         # add rotation
         # matrix = self.get_matrix(img, self.angle)
         # img = self.perspective_transform(img, matrix)
 
         img = self.rgb_transform(img)
-        ps= Image.open(ps_path).convert('RGB')
+        # ps= Image.open(ps_path).convert('RGB')
+        ps = robust_read_image(ps_path, mode='RGB')
         # # add rotation
         # ps = self.perspective_transform(ps, matrix)
 
@@ -280,34 +396,76 @@ class TrainDataset(BaseAnomalyDetectionDataset):
         else:
             organized_pc = read_tiff_organized_pc(tiff_path)
 
-        # === 关键补丁：修复 XY 和 Z 通道中的 NaN ===
-        # 用像素坐标覆盖 XY，避免 XY 里也有 NaN / 脏值
-        for x in range(organized_pc.shape[0]):
-            for y in range(organized_pc.shape[1]):
-                organized_pc[x, y, 0] = x
-                organized_pc[x, y, 1] = y
+        # # === 关键补丁：修复 XY 和 Z 通道中的 NaN ===
+        # # 用像素坐标覆盖 XY，避免 XY 里也有 NaN / 脏值
+        # for x in range(organized_pc.shape[0]):
+        #     for y in range(organized_pc.shape[1]):
+        #         organized_pc[x, y, 0] = x
+        #         organized_pc[x, y, 1] = y
 
-        # 只对 Z 通道做 NaN 修复：把 NaN 替换成最小有效深度
+        # # 只对 Z 通道做 NaN 修复：把 NaN 替换成最小有效深度
+        # z_channel = organized_pc[:, :, 2]
+        # if np.isnan(z_channel).any():
+        #     min_z = np.nanmin(z_channel)  # 忽略 NaN 计算最小值
+        #     z_channel[np.isnan(z_channel)] = min_z
+        #     organized_pc[:, :, 2] = z_channel.astype(np.float32)
+        #     # print("train z_channel nan filled")
+
+        # # 再去算 depth map & resize
+        # depth_map_3channel = np.repeat(
+        #     organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2
+        # )
+        # resized_depth_map_3channel = resize_organized_pc(depth_map_3channel)
+        # resized_organized_pc = resize_organized_pc(
+        #     organized_pc, target_height=self.size, target_width=self.size
+        # )
+        # resized_organized_pc = resized_organized_pc.clone().detach().float()
+
+        
+        # 1. 极速向量化修复 XY 坐标 (替代缓慢的 for 循环)
+        H_pc, W_pc = organized_pc.shape[:2]
+        grid_x, grid_y = np.mgrid[0:H_pc, 0:W_pc]
+        organized_pc[:, :, 0] = grid_x
+        organized_pc[:, :, 1] = grid_y
+
+        # 2. 修复 Z 通道的 NaN
         z_channel = organized_pc[:, :, 2]
         if np.isnan(z_channel).any():
-            min_z = np.nanmin(z_channel)  # 忽略 NaN 计算最小值
+            min_z = np.nanmin(z_channel)
             z_channel[np.isnan(z_channel)] = min_z
             organized_pc[:, :, 2] = z_channel.astype(np.float32)
-            # print("train z_channel nan filled")
 
-        # 再去算 depth map & resize
+        # 3. 计算 2D 深度图供 2D 分支使用并 Resize
         depth_map_3channel = np.repeat(
             organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2
         )
-        resized_depth_map_3channel = resize_organized_pc(depth_map_3channel)
+        # Resize 深度图
+        resized_depth_map_3channel = resize_organized_pc(depth_map_3channel, target_height=self.size, target_width=self.size)
+
+        # ==========================================
+        # ★ 核心修复：必须先 Resize 点云，再采样前景！
+        # ==========================================
         resized_organized_pc = resize_organized_pc(
             organized_pc, target_height=self.size, target_width=self.size
         )
-        resized_organized_pc = resized_organized_pc.clone().detach().float()
+        
+        # ★ 修复 Shape 错位：将 [3, 224, 224] 还原为 [224, 224, 3]
+        if resized_organized_pc.shape[0] == 3:
+            resized_organized_pc = resized_organized_pc.permute(1, 2, 0)
+            
+        # 将 tensor 转回 numpy 以便在 CPU 端执行我们的混合 FPS
+        resized_organized_pc_np = resized_organized_pc.cpu().numpy()
+
+        # 4. 在安全的 224x224 网格上提取 4096 个归一化的纯净前景点
+        sampled_pc, sampled_idx = get_foreground_fps_pc(resized_organized_pc_np, num_points=4096)
+        
+        # ★ 终极护盾 1：强制 Numpy 重新分配一块连续的物理内存，防止跨进程指针越界崩溃！
+        sampled_pc_tensor = torch.from_numpy(np.ascontiguousarray(sampled_pc)).float()
+        sampled_idx_tensor = torch.from_numpy(np.ascontiguousarray(sampled_idx)).long()
 
 
-
-        return (img, resized_organized_pc, resized_depth_map_3channel,ps), label
+        # return (img, resized_organized_pc, resized_depth_map_3channel,ps), label
+        return (img, sampled_pc_tensor, sampled_idx_tensor, resized_depth_map_3channel,ps), label
 
 
 class TestDataset(BaseAnomalyDetectionDataset):
@@ -391,14 +549,16 @@ class TestDataset(BaseAnomalyDetectionDataset):
         rgb_path = img_path[0]
         tiff_path = img_path[1]
         ps_path = img_path[2]
-        img_original = Image.open(rgb_path).convert('RGB')
+        # img_original = Image.open(rgb_path).convert('RGB')
+        img_original = robust_read_image(rgb_path, mode='RGB')
         # matrix = self.get_matrix(img_original, self.angle)
         # img_original = self.perspective_transform(img_original, matrix)
 
         # axes[0].imshow(cv2.cvtColor(self.pillow_to_opencv(img_original), cv2.COLOR_BGR2RGB))
 
         img = self.rgb_transform(img_original)
-        ps_original = Image.open(ps_path).convert('RGB')
+        # ps_original = Image.open(ps_path).convert('RGB')
+        ps_original = robust_read_image(ps_path, mode='RGB')
         # ps_original = self.perspective_transform(ps_original, matrix)
         ps = self.rgb_transform(ps_original)
         # organized_pc = read_tiff_organized_pc(tiff_path)
@@ -411,27 +571,68 @@ class TestDataset(BaseAnomalyDetectionDataset):
         else:
             organized_pc = read_tiff_organized_pc(tiff_path)
 
-        # === 关键补丁：和 Valid 一致，修 XY + Z 的 NaN ===
-        for x in range(organized_pc.shape[0]):
-            for y in range(organized_pc.shape[1]):
-                organized_pc[x, y, 0] = x
-                organized_pc[x, y, 1] = y
+        # # === 关键补丁：和 Valid 一致，修 XY + Z 的 NaN ===
+        # for x in range(organized_pc.shape[0]):
+        #     for y in range(organized_pc.shape[1]):
+        #         organized_pc[x, y, 0] = x
+        #         organized_pc[x, y, 1] = y
 
+        # z_channel = organized_pc[:, :, 2]
+        # if np.isnan(z_channel).any():
+        #     min_z = np.nanmin(z_channel)
+        #     z_channel[np.isnan(z_channel)] = min_z
+        #     organized_pc[:, :, 2] = z_channel.astype(np.float32)
+        #     # print("test z_channel nan filled")
+
+        # depth_map_3channel = np.repeat(
+        #     organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2
+        # )
+        # resized_depth_map_3channel = resize_organized_pc(depth_map_3channel)
+        # resized_organized_pc = resize_organized_pc(
+        #     organized_pc, target_height=self.size, target_width=self.size
+        # )
+        # resized_organized_pc = resized_organized_pc.clone().detach().float()
+        
+        
+        # 1. 极速向量化修复 XY 坐标 (替代缓慢的 for 循环)
+        H_pc, W_pc = organized_pc.shape[:2]
+        grid_x, grid_y = np.mgrid[0:H_pc, 0:W_pc]
+        organized_pc[:, :, 0] = grid_x
+        organized_pc[:, :, 1] = grid_y
+
+        # 2. 修复 Z 通道的 NaN
         z_channel = organized_pc[:, :, 2]
         if np.isnan(z_channel).any():
             min_z = np.nanmin(z_channel)
             z_channel[np.isnan(z_channel)] = min_z
             organized_pc[:, :, 2] = z_channel.astype(np.float32)
-            print("test z_channel nan filled")
 
+        # 3. 计算 2D 深度图供 2D 分支使用并 Resize
         depth_map_3channel = np.repeat(
             organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2
         )
-        resized_depth_map_3channel = resize_organized_pc(depth_map_3channel)
+        # Resize 深度图
+        resized_depth_map_3channel = resize_organized_pc(depth_map_3channel, target_height=self.size, target_width=self.size)
+
+        # ==========================================
+        # ★ 核心修复：必须先 Resize 点云，再采样前景！
+        # ==========================================
         resized_organized_pc = resize_organized_pc(
             organized_pc, target_height=self.size, target_width=self.size
         )
-        resized_organized_pc = resized_organized_pc.clone().detach().float()
+        
+        # ★ 修复 Shape 错位：将 [3, 224, 224] 还原为 [224, 224, 3]
+        if resized_organized_pc.shape[0] == 3:
+            resized_organized_pc = resized_organized_pc.permute(1, 2, 0)
+            
+        # 将 tensor 转回 numpy 以便在 CPU 端执行我们的混合 FPS
+        resized_organized_pc_np = resized_organized_pc.cpu().numpy()
+
+        # 4. 在安全的 224x224 网格上提取 4096 个归一化的纯净前景点
+        sampled_pc, sampled_idx = get_foreground_fps_pc(resized_organized_pc_np, num_points=4096)
+        
+        sampled_pc_tensor = torch.from_numpy(sampled_pc).float()
+        sampled_idx_tensor = torch.from_numpy(sampled_idx).long()
 
 
 
@@ -442,7 +643,8 @@ class TestDataset(BaseAnomalyDetectionDataset):
                 [1, resized_depth_map_3channel.size()[-2], resized_depth_map_3channel.size()[-2]])
             # axes[1].imshow(self.pillow_to_opencv(gt), cmap='gray')
         else:
-            gt = Image.open(gt).convert('L')
+            # gt = Image.open(gt).convert('L')
+            gt = robust_read_image(gt, mode='L')
             # gt = self.perspective_transform(gt, matrix)
             # axes[1].imshow(self.pillow_to_opencv(gt), cmap='gray')
             gt = self.gt_transform(gt)
@@ -452,7 +654,7 @@ class TestDataset(BaseAnomalyDetectionDataset):
         # fig.savefig("test_image_3.png", dpi=300, bbox_inches='tight')
 
         # return (img, resized_depth_map_3channel,ps), gt[:1], label, rgb_path
-        return (img, resized_organized_pc, resized_depth_map_3channel, ps), gt[:1], label, rgb_path
+        return (img, sampled_pc_tensor, sampled_idx_tensor, resized_depth_map_3channel, ps), gt[:1], label, rgb_path
 
 
 class ValidDataset(BaseAnomalyDetectionDataset):
@@ -541,14 +743,16 @@ class ValidDataset(BaseAnomalyDetectionDataset):
         rgb_path = img_path[0]
         tiff_path = img_path[1]
         ps_path = img_path[2]
-        img_original = Image.open(rgb_path).convert('RGB')
+        # img_original = Image.open(rgb_path).convert('RGB')
+        img_original = robust_read_image(rgb_path, mode='RGB')
         matrix = self.get_matrix(img_original, self.angle)
         img_original = self.perspective_transform(img_original, matrix)
 
         # axes[0].imshow(cv2.cvtColor(self.pillow_to_opencv(img_original), cv2.COLOR_BGR2RGB))
 
         img = self.rgb_transform(img_original)
-        ps_original = Image.open(ps_path).convert('RGB')
+        # ps_original = Image.open(ps_path).convert('RGB')
+        ps_original = robust_read_image(ps_path, mode='RGB')
         ps_original = self.perspective_transform(ps_original, matrix)
         ps = self.rgb_transform(ps_original)
         # organized_pc = read_tiff_organized_pc(tiff_path)
@@ -561,22 +765,62 @@ class ValidDataset(BaseAnomalyDetectionDataset):
         else:
             organized_pc = read_tiff_organized_pc(tiff_path)
 
-        for x in range(organized_pc.shape[0]):
-            for y in range(organized_pc.shape[1]):
-                organized_pc[x, y, 0] = x
-                organized_pc[x, y, 1] = y
+        # for x in range(organized_pc.shape[0]):
+        #     for y in range(organized_pc.shape[1]):
+        #         organized_pc[x, y, 0] = x
+        #         organized_pc[x, y, 1] = y
 
+        # z_channel = organized_pc[:, :, 2]
+        # if np.isnan(z_channel).any():
+        #     min_z = np.nanmin(z_channel)  # 计算 g 通道的最小值，忽略 NaN
+        #     z_channel[np.isnan(z_channel)] = min_z
+        #     organized_pc[:, :, 2] = z_channel.astype(np.float32)
+        #     # print("val z_channel nan filled")
+
+        # depth_map_3channel = np.repeat(organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2)
+        # resized_depth_map_3channel = resize_organized_pc(depth_map_3channel)
+        # resized_organized_pc = resize_organized_pc(organized_pc, target_height=self.size, target_width=self.size)
+        # resized_organized_pc = resized_organized_pc.clone().detach().float()
+        
+        # 1. 极速向量化修复 XY 坐标 (替代缓慢的 for 循环)
+        H_pc, W_pc = organized_pc.shape[:2]
+        grid_x, grid_y = np.mgrid[0:H_pc, 0:W_pc]
+        organized_pc[:, :, 0] = grid_x
+        organized_pc[:, :, 1] = grid_y
+
+        # 2. 修复 Z 通道的 NaN
         z_channel = organized_pc[:, :, 2]
         if np.isnan(z_channel).any():
-            min_z = np.nanmin(z_channel)  # 计算 g 通道的最小值，忽略 NaN
+            min_z = np.nanmin(z_channel)
             z_channel[np.isnan(z_channel)] = min_z
             organized_pc[:, :, 2] = z_channel.astype(np.float32)
-            print("val z_channel nan filled")
 
-        depth_map_3channel = np.repeat(organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2)
-        resized_depth_map_3channel = resize_organized_pc(depth_map_3channel)
-        resized_organized_pc = resize_organized_pc(organized_pc, target_height=self.size, target_width=self.size)
-        resized_organized_pc = resized_organized_pc.clone().detach().float()
+        # 3. 计算 2D 深度图供 2D 分支使用并 Resize
+        depth_map_3channel = np.repeat(
+            organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2
+        )
+        # Resize 深度图
+        resized_depth_map_3channel = resize_organized_pc(depth_map_3channel, target_height=self.size, target_width=self.size)
+
+        # ==========================================
+        # ★ 核心修复：必须先 Resize 点云，再采样前景！
+        # ==========================================
+        resized_organized_pc = resize_organized_pc(
+            organized_pc, target_height=self.size, target_width=self.size
+        )
+        
+        # ★ 修复 Shape 错位：将 [3, 224, 224] 还原为 [224, 224, 3]
+        if resized_organized_pc.shape[0] == 3:
+            resized_organized_pc = resized_organized_pc.permute(1, 2, 0)
+            
+        # 将 tensor 转回 numpy 以便在 CPU 端执行我们的混合 FPS
+        resized_organized_pc_np = resized_organized_pc.cpu().numpy()
+
+        # 4. 在安全的 224x224 网格上提取 4096 个归一化的纯净前景点
+        sampled_pc, sampled_idx = get_foreground_fps_pc(resized_organized_pc_np, num_points=4096)
+        
+        sampled_pc_tensor = torch.from_numpy(sampled_pc).float()
+        sampled_idx_tensor = torch.from_numpy(sampled_idx).long()
 
 
 
@@ -586,7 +830,8 @@ class ValidDataset(BaseAnomalyDetectionDataset):
                 [1, resized_depth_map_3channel.size()[-2], resized_depth_map_3channel.size()[-2]])
             # axes[1].imshow(self.pillow_to_opencv(gt), cmap='gray')
         else:
-            gt = Image.open(gt).convert('L')
+            # gt = Image.open(gt).convert('L')
+            gt = robust_read_image(gt, mode='L')
             gt = self.perspective_transform(gt, matrix)
             # axes[1].imshow(self.pillow_to_opencv(gt), cmap='gray')
             gt = self.gt_transform(gt)
@@ -595,7 +840,7 @@ class ValidDataset(BaseAnomalyDetectionDataset):
         # fig.show()
         # fig.savefig("test_image_3.png", dpi=300, bbox_inches='tight')
 
-        return (img, resized_organized_pc, resized_depth_map_3channel, ps), gt[:1], label, rgb_path
+        return (img, sampled_pc_tensor, sampled_idx_tensor, resized_depth_map_3channel, ps), gt[:1], label, rgb_path
 
 
 # 该函数用于将数据集分成多个组，每个组包含50个样本。它会确保至少有一组包含 GOOD 数据，并将 GOOD 数据平均分配给其他组。
@@ -727,9 +972,11 @@ def get_data_loader(split, class_name, img_size, args, defect_name=None):
         dataset=dataset, 
         batch_size=batch_size,  # 使用动态变量
         shuffle=shuffle,        # 使用动态变量
-        num_workers=4,          # 建议设为 4 或 8 加速数据读取
+        # num_workers=4,          # 建议设为 4 或 8 加速数据读取  初始
+        num_workers=0,
         drop_last=(split=='train'), # 训练时丢弃最后一个不完整的 batch 防止报错
-        pin_memory=True
+        pin_memory=True        # 初始
+        # pin_memory=False
     )
     return data_loader
     
