@@ -66,15 +66,20 @@ def robust_read_image(path, mode='RGB'):
 
 
 def get_foreground_fps_pc(organized_pc, num_points=4096):
-    """
-    在 CPU 端执行前景提取与 Farthest Point Sampling。
-    保证输出的 Tensor 完美对齐 [4096, 3]，并且彻底抛弃背景。
-    """
     z_channel = organized_pc[:, :, 2]
     min_z = np.nanmin(z_channel)
     
-    # 1. 提取前景 (Z轴高于背景)
+    # 1. 提取初始前景 (Z轴高于背景)
     fg_mask = z_channel > (min_z + 1e-5)
+    
+    # ==========================================
+    # ★ 核心修复：腐蚀边缘伪影 (移除最外侧的 2-3 个像素)
+    # 彻底杜绝 Resize 插值导致的边缘“悬崖”被 FPS 采样
+    # ==========================================
+    kernel = np.ones((5, 5), np.uint8) # 5x5 的核可以腐蚀掉外围 2 个像素，你可以根据需要调整为 3x3
+    fg_mask_eroded = cv2.erode(fg_mask.astype(np.uint8), kernel, iterations=1)
+    fg_mask = fg_mask_eroded > 0
+    
     fg_points = organized_pc[fg_mask]
     
     # ★ 新增：记录全局一维索引 (0 ~ 50175)
@@ -423,10 +428,19 @@ class TrainDataset(BaseAnomalyDetectionDataset):
 
         
         # 1. 极速向量化修复 XY 坐标 (替代缓慢的 for 循环)
+        # H_pc, W_pc = organized_pc.shape[:2]
+        # grid_x, grid_y = np.mgrid[0:H_pc, 0:W_pc]
+        # organized_pc[:, :, 0] = grid_x
+        # organized_pc[:, :, 1] = grid_y
+        
+        
+        # 1. 极速向量化修复 XY 坐标 (修复轴颠倒 Bug)
         H_pc, W_pc = organized_pc.shape[:2]
-        grid_x, grid_y = np.mgrid[0:H_pc, 0:W_pc]
-        organized_pc[:, :, 0] = grid_x
-        organized_pc[:, :, 1] = grid_y
+        # ★ 核心修复 2：使用 meshgrid，明确指定 arange(W) 为 X，arange(H) 为 Y
+        grid_x, grid_y = np.meshgrid(np.arange(W_pc), np.arange(H_pc))
+        
+        organized_pc[:, :, 0] = grid_x.astype(np.float32)
+        organized_pc[:, :, 1] = grid_y.astype(np.float32)
 
         # 2. 修复 Z 通道的 NaN
         z_channel = organized_pc[:, :, 2]
