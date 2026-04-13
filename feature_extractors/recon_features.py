@@ -252,7 +252,7 @@ class ReconFeatures(nn.Module):
         self.maps_2d = [] 
         self.maps_3d = []
 
-    def compute_hybrid_loss(self, pred, target, dim=-1, mask=None):
+    def compute_hybrid_loss(self, pred, target, dim=-1, mask=None, use_smooth_l1=False, beta=0.1):
         pred_safe = pred + 1e-8
         target_safe = target + 1e-8
         
@@ -260,7 +260,16 @@ class ReconFeatures(nn.Module):
         
         pred_norm = F.normalize(pred, p=2, dim=dim)
         target_norm = F.normalize(target, p=2, dim=dim)
-        l2_loss_raw = F.mse_loss(pred_norm, target_norm, reduction='none')
+        
+        # ==========================================
+        # ★ 核心改动：高频宽容机制 (High-Frequency Tolerance)
+        # ==========================================
+        if use_smooth_l1:
+            # 误差 > beta 时转换为线性惩罚，防止边缘的高频拓扑抖动引发梯度爆炸
+            l2_loss_raw = F.smooth_l1_loss(pred_norm, target_norm, reduction='none', beta=beta)
+        else:
+            # 原始的 MSE，对微小误差进行平方放大
+            l2_loss_raw = F.mse_loss(pred_norm, target_norm, reduction='none')
         
         if dim == 1: 
             l2_loss = l2_loss_raw.mean(dim=1)
@@ -302,11 +311,22 @@ class ReconFeatures(nn.Module):
         train_mask_224 = 1.0 - eroded_bg
         train_mask_28 = F.interpolate(train_mask_224, size=(28, 28), mode='nearest').squeeze(1) 
 
-        loss_2d = self.compute_hybrid_loss(rgb_recon, rgb_target.detach(),dim = 1, mask=train_mask_28) 
+        # 2D 保持原有的 MSE，维持对 RGB 纹理细节的极高敏感度
+        loss_2d = self.compute_hybrid_loss(
+            rgb_recon, rgb_target.detach(), dim=1, mask=train_mask_28, 
+            use_smooth_l1=False
+        ) 
         
-        # ★ 因为现在的点云已经是 100% 前景了，3D 掩码就是直接用随机 Mask 即可！无需再过滤背景！
         effective_3d_mask = mask
-        loss_3d_feat = self.compute_hybrid_loss(xyz_feat_recon, F_feat_gt, dim=2, mask=effective_3d_mask)
+        # ==========================================
+        # ★ 启用 3D 边界宽容
+        # 设定 beta=0.1：当重建误差 < 0.1（如平坦表面的真实微小缺陷）时，依旧使用 L2 进行精细优化；
+        # 当重建误差 > 0.1（如把手边缘因采样和插值导致的剧烈拓扑畸变）时，转为 L1 线性惩罚，不让模型过度纠结于修复边缘。
+        # ==========================================
+        loss_3d_feat = self.compute_hybrid_loss(
+            xyz_feat_recon, F_feat_gt, dim=2, mask=effective_3d_mask, 
+            use_smooth_l1=True, beta=0.1
+        )
         loss_3d = loss_3d_feat 
         
         w_alpha = 1.0
@@ -359,8 +379,12 @@ class ReconFeatures(nn.Module):
                 
                 xyz_feat_norm = F.normalize(xyz_feat_recon, p=2, dim=2)
                 F_feat_gt_norm = F.normalize(F_feat_gt, p=2, dim=2)
+                # err_3d_feat_current = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
+                #                       self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+                # ★ 新代码：保持与训练阶段相同的 Smooth L1 宽容度
+                l2_diff_3d = F.smooth_l1_loss(xyz_feat_norm, F_feat_gt_norm, reduction='none', beta=0.1).mean(dim=2)
                 err_3d_feat_current = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
-                                      self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+                                    self.l2_weight * l2_diff_3d
                 err_3d_feat_ensemble += (err_3d_feat_current * mask)
                 mask_visit_count += mask
 
@@ -441,8 +465,12 @@ class ReconFeatures(nn.Module):
             
             xyz_feat_norm = F.normalize(xyz_feat_recon, p=2, dim=2)
             F_feat_gt_norm = F.normalize(F_feat_gt, p=2, dim=2)
+            # err_3d_feat_current = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
+            #                       self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+            # ★ 新代码：推理时同步使用 Smooth L1 防止边界得分爆炸
+            l2_diff_3d = F.smooth_l1_loss(xyz_feat_norm, F_feat_gt_norm, reduction='none', beta=0.1).mean(dim=2)
             err_3d_feat_current = (1 - F.cosine_similarity(xyz_feat_recon + 1e-8, F_feat_gt + 1e-8, dim=2)) + \
-                                  self.l2_weight * torch.mean((xyz_feat_norm - F_feat_gt_norm) ** 2, dim=2)
+                                self.l2_weight * l2_diff_3d
             err_3d_feat_ensemble += (err_3d_feat_current * mask)
             mask_visit_count += mask
 
