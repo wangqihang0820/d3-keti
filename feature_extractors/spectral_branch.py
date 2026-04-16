@@ -44,84 +44,88 @@ class SpectralTransform(nn.Module):
         return f_spatial
 
 
+# v34以及之后的   基于能量比例的动态硬切分门控
 class DynamicContentGating(nn.Module):
     """
-    Step 3.2: 基于内容的动态门控 (Content-Based Dynamic Gating, CBDG)
-    参照图示: Input -> GAP -> MLP -> (+) Bias -> Sigmoid -> Gate
+    Step 3.2: 基于能量比例的动态硬切分门控 (Energy-Proportional Hard Gating with STE)
+    核心思想: 动态预测一个能量比例(如90%)，将累积能量达到该比例之前的所有频率划为低频，其余为高频。
     """
     def __init__(self, num_points=1024, reduction=16):
         super().__init__()
         
-        # 1. MLP 网络 (Perception Prediction)
-        # 输入: 谱能量分布 E_spec [B, M]
-        # 作用: 根据当前样本的频谱指纹，动态调整滤波策略
         hidden_dim = max(num_points // reduction, 16)
         
+        # 此时的 MLP 不再预测 1024 个频率的独立门控，
+        # 而是预测当前工件的"目标能量保留比例 (Target Ratio)"
         self.mlp = nn.Sequential(
             nn.Linear(num_points, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, num_points)
+            nn.Linear(hidden_dim, 1) # 输出一个标量 logits
         )
         
-        # 2. 预设线性下降向量 (b_decay)
-        # 作用: 赋予门控“低通”的初始属性。
-        # 初始状态: 低频处(索引0) bias > 0 (Sigmoid -> 1), 高频处(索引M) bias < 0 (Sigmoid -> 0)
-        # 我们将其注册为 buffer，这样它会保存在模型权重中，但不会被梯度更新（保持物理先验）
-        # 范围设为 [3.0, -3.0]，使得 Sigmoid 初始范围覆盖约 [0.95, 0.05]
-        decay_vector = torch.linspace(3.0, -3.0, num_points) 
-        self.register_buffer('b_decay', decay_vector.view(1, -1)) # [1, M]
+        # 设置一个初始偏置，例如初始化为 2.0
+        # sigmoid(2.0) ≈ 0.88，意味着训练初期默认保留前 88% 的能量作为低频骨架
+        self.bias_ratio = nn.Parameter(torch.tensor([2.0])) 
 
     def forward(self, f_spec):
         """
         Args:
-            f_spec: [B, M, C] 全频段特征
-        Returns:
-            f_low:  [B, M, C] 低频分支特征
-            f_high: [B, M, C] 高频分支特征
-            gate:   [B, M, 1] 门控可视化图
+            f_spec: [B, M, C] 全频段特征 
+            (注: torch.linalg.eigh 输出的特征向量已经天然按照频率从低到高排列)
         """
         B, M, C = f_spec.shape
         
         # ----------------------------------------------------
-        # 1. 谱能量聚合 (Spectral Energy Aggregation)
+        # 1. 频域能量计算与累积 (Energy Accumulation)
         # ----------------------------------------------------
-        # 对应图中的 GAP (Global Average Pooling on Channel dim)
-        # 计算每个频率点的平均能量幅度
-        # [B, M, C] -> [B, M]
-        energy = f_spec.abs().mean(dim=-1)
+        # 计算每个频率分量的绝对能量 [B, M]
+        energy = f_spec.abs().mean(dim=-1) 
+        
+        # 计算总能量 [B, 1]
+        total_energy = energy.sum(dim=-1, keepdim=True) + 1e-6 
+        
+        # 计算从低频到高频的累积能量 [B, M]
+        cum_energy = torch.cumsum(energy, dim=-1)
+        
+        # 计算累积能量占比 (递增序列，从 >0 到 1.0) [B, M]
+        cum_ratio = cum_energy / total_energy 
         
         # ----------------------------------------------------
-        # 2. 感知预测 (Perception Prediction)
+        # 2. 预测目标能量比例 (Target Ratio Prediction)
         # ----------------------------------------------------
-        # 通过 MLP 预测基于内容的动态 Logits
-        # [B, M] -> [B, M]
-        logits_content = self.mlp(energy)
+        # MLP 根据全局能量分布预测 logits，再加上物理先验偏置
+        logits_ratio = self.mlp(energy) + self.bias_ratio # [B, 1]
+        
+        # 转换为 0~1 之间的目标比例 (如 0.85) [B, 1]
+        target_ratio = torch.sigmoid(logits_ratio) 
         
         # ----------------------------------------------------
-        # 3. 物理偏置注入 (Bias Injection)
+        # 3. 基于比例的硬切分与 STE 魔法
         # ----------------------------------------------------
-        # Logits = MLP(E) + b_decay
-        # 结合了“当前内容需求”和“低通物理先验”
-        logits = logits_content + self.b_decay
+        # Hard Gate: 累积占比 <= 目标比例的，设为 1 (低频)；超过的设为 0 (高频)
+        hard_gate = (cum_ratio <= target_ratio).float() # [B, M]
         
-        # ----------------------------------------------------
-        # 4. 门控生成 (Gating Generation)
-        # ----------------------------------------------------
-        # G_dyn = Sigmoid(Logits)
-        gate = torch.sigmoid(logits) # [B, M]
+        # Soft Gate (用于提供梯度): 
+        # 使用平滑的 Sigmoid 阶跃函数。当 cum_ratio < target_ratio 时趋于1，反之趋于0
+        # 放大系数 alpha=10 控制梯度平滑度
+        soft_gate = torch.sigmoid(10.0 * (target_ratio - cum_ratio)) # [B, M]
         
-        # 扩展维度以便广播: [B, M, 1]
+        # STE 直通估计器：前向是绝对硬切分，反向通过 soft_gate 传递梯度给 target_ratio
+        gate = hard_gate.detach() - soft_gate.detach() + soft_gate # [B, M]
+        
+        # 扩展维度 [B, M, 1]
         gate_expanded = gate.unsqueeze(-1)
         
         # ----------------------------------------------------
-        # 5. 软切分 (Soft Split)
+        # 4. 正交分离
         # ----------------------------------------------------
-        # F_low = F * G
         f_low = f_spec * gate_expanded
-        
-        # F_high = F * (1 - G)
         f_high = f_spec * (1.0 - gate_expanded)
+        
+        # 测试阶段可以选择性打印 target_ratio 查看网络学到的切分比例
+        # if not self.training:
+        #     print(f"当前样本的动态截断能量比例: {target_ratio.mean().item():.3f}")
         
         return f_low, f_high, gate_expanded
       
