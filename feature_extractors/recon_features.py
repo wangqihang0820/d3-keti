@@ -730,7 +730,3 @@ class ReconFeatures(nn.Module):
         
         assert gts_flat.shape == preds_flat.shape, f"Shape mismatch: GT {gts_flat.shape} vs Pred {preds_flat.shape}"
         self.pixel_rocauc = float(roc_auc_score(gts_flat, preds_flat))
-
-# v34：基于v31，改动CBDG         [limit_switch] Image AUC: 0.9948 | Pixel AUC: 0.8466   pit缺陷还可以
-# 之后把CBDG直接换成硬切分（不要动态）跑一下   或者  带图优化代码
-
